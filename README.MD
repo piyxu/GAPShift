@@ -1,4 +1,4 @@
-# Repositioning Information in the Data Space (GAP-Based System)
+# GAPShift: A Reversible Data Transformation
 
 ## Overview
 
