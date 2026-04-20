@@ -386,16 +386,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reversible_ok,
     )?;
 
-    println!("Tamamlandı.");
-    println!("Tarih                     : 2026-04-20");
-    println!("Kayıt sayısı              : {}", COUNT);
+    println!("Completed.");
+    println!("Date                      : 2026-04-20");
+    println!("Record count              : {}", COUNT);
     println!("Bit width                 : {}", BIT_WIDTH);
     println!("Min gap                   : {}", min_gap);
     println!("Metadata D                : {}", metadata_d);
-    println!("Sıra korunuyor mu         : {}", order_ok);
-    println!("Tersinirlik               : {}", reversible_ok);
-    println!("Değişen kayıt             : {}", changed_count);
-    println!("Aynı kalan kayıt          : {}", same_count);
+    println!("Order preserved           : {}", order_ok);
+    println!("Reversible                : {}", reversible_ok);
+    println!("odified records           : {}", changed_count);
+    println!("Unchanged records         : {}", same_count);
     println!("metadata.txt              : {}", METADATA_FILE);
     println!("space.txt                 : {}", OUTPUT_FILE);
     println!("smallest_two_outputs.txt  : {}", SMALLEST_TWO_OUTPUTS_FILE);
