@@ -1,4 +1,4 @@
-// Repositioning of Information Combined Within Data Space
+// GAPShift: A Reversible Data Transformation
 // © 2026 Mesut Erturhan / GITHUB PIYXU
 // Licensed under the GNU General Public License v3.0.
 
