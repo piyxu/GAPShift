@@ -1,15 +1,15 @@
-# Repositioning Information in the Data Space
+# Repositioning Information in the Data Space (GAP-Based System)
 
 ## Overview
 
-This project explores a transformation technique that repositions information within a numerical space while preserving its structure and enabling full reversibility using a single metadata value.
+This project implements a reversible transformation over a set of 256-bit integers by **repositioning values within the numeric space using a deterministic GAP-based shifting system**.
 
-Given a set of 256-bit integers, we:
+Unlike the previous version (D-based), this system:
 
-- Reorder them in descending order
-- Apply deterministic shifts based on a global parameter D
-- Encode them into a new space
-- Recover the original values using only D
+* Uses a **single global GAP value**
+* Applies shifts only starting from a configurable index (`START_INDEX`)
+* Preserves ordering
+* Enables full reversibility using only GAP
 
 ---
 
@@ -17,91 +17,190 @@ Given a set of 256-bit integers, we:
 
 ### Encoding
 
-`y = x - shift(i) ` 
-`shift(i) = (i + 1) * D`
+Values are sorted in ascending order.
+
+For each value:
+
+```
+shift(i) = (i - START_INDEX + 1) * GAP   if i >= START_INDEX
+shift(i) = 0                             if i < START_INDEX
+```
+
+```
+y = x - shift(i)
+```
 
 Where:
-- x = original value
-- y = encoded value
-- i = index in descending order
-- D = global metadata
+
+* `x` = original value
+* `y` = encoded value
+* `i` = index in ascending order
+* `GAP` = global metadata
+* `START_INDEX` = where shifting begins
 
 ---
 
 ### Decoding
 
-`x = y + shift(i)`
+```
+x = y + shift(i)
+```
 
-No per-record metadata is required.  
-All shifts are reconstructed deterministically from D.
+The same shift is reconstructed deterministically using GAP and index.
 
 ---
 
 ## Key Property
 
-If ordering is preserved after encoding, the transformation is fully reversible.
+If ordering is preserved:
 
-`order_ok = y[i] > y[i+1] for all i`
+```
+y[i] < y[i+1] for all i
+```
 
-`If order_ok == true:`
+Then:
 
-`decoded == original`
+```
+decoded == original
+```
 
 ---
 
-## Metadata (D)
+## GAP Selection
 
-`D = min((min_gap // 2) - 2, min_value // COUNT)`
+GAP is derived from the **active region only** (starting at `START_INDEX`):
+
+```
+active_min_gap = min(sorted[i] - sorted[i-1]) for i >= START_INDEX
+```
+
+Then:
+
+```
+gap_by_order = active_min_gap - 2
+gap_by_value = start_value / active_count
+
+GAP = min(gap_by_order, gap_by_value)
+```
 
 Where:
-- min_gap = smallest difference between sorted input values
-- min_value = smallest input value
-- COUNT = number of elements
+
+* `start_value = sorted[START_INDEX]`
+* `active_count = COUNT - START_INDEX`
 
 ---
 
 ## Safety Constraints
 
-1) No overlap (ordering preserved):
-`D < min_gap`
+1. Order preservation:
 
-2) No underflow `(stay >= 0):`
-`COUNT * D <= min_value`
+```
+GAP < active_min_gap
+```
+
+2. No underflow:
+
+```
+active_count * GAP <= start_value
+```
+
+---
+
+## System Behavior
+
+* The smallest values (before `START_INDEX`) remain unchanged
+* Each subsequent value is shifted more than the previous one
+* Shift grows linearly: `+GAP` per step
+
+### Example
+
+```
+Index:        0    1    2    3
+Values:      10   15   20   25
+START_INDEX = 1
+GAP = 3
+
+Encoded:
+10 -> 10
+15 -> 12   (-3)
+20 -> 14   (-6)
+25 -> 16   (-9)
+```
 
 ---
 
 ## Output Files
 
 ### metadata.txt
-Contains only the metadata D in 256-bit binary form.
+
+Contains the GAP value in 256-bit binary form.
 
 ### space.txt
-Full dataset including original, encoded, decoded values and bit representations.
+
+Detailed dataset including:
+
+* original values
+* encoded values
+* decoded values
+* bit representations
+* applied shifts
 
 ### smallest_two_outputs.txt
+
 Displays the two smallest encoded values.
 
 ### gap.txt
-Displays smallest values and their difference.
+
+Shows smallest encoded values and their difference.
+
+### input.txt
+
+Raw input values as pure 256-bit binary strings (one per line).
+
+### encode.txt
+
+Encoded values as pure 256-bit binary strings (one per line).
+
+---
+
+## Decode Mode
+
+You can decode encoded bit files using:
+
+```
+program -d <source_bits_file> <output_file>
+```
+
+### Example
+
+```
+program -d encode.txt decoded.txt
+```
+
+### Requirements
+
+* `metadata.txt` must exist
+* Bit width must match
 
 ---
 
 ## Notes
 
-- Experimental project
-- Not a cryptographic system
-- Behavior depends on input distribution
-- This system does not violate Shannon's entropy; it merely optimizes the noise within the addressing space.
+* Fully reversible transformation
+* Deterministic (no randomness in encoding phase)
+* Not a cryptographic system
+* Designed for structural data repositioning experiments
+* Entropy is preserved; only spatial distribution changes
 
 ---
 
 ## Author
 
-Mesut Erturhan  
-April 20, 2026
+Mesut Erturhan
+April 20, 2026 - Update 21-04-2026
 
 ---
 
 ## License
 
-GPL-3.0 (GNU General Public License v3.0
+GPL-3.0 (GNU General Public License v3.0)
