@@ -4,41 +4,106 @@
 
 // Code implementation and enhancement assisted by ChatGPT.
 // Core principles developed in collaboration with Gemini.
-// https://github.com/piyxu/RICWDS/
+// https://github.com/piyxu/GAPShift/
+//GAPShift Version Update Version 0.1
 
 // ==========================================================
 // CORE IDEA
 // ----------------------------------------------------------
-// We transform 256-bit numbers using a single reversible GAP.
+// GAPShift transforms 256-bit numbers with a single reversible
+// GAP derived from the closest adjacent pair in sorted order.
 //
-// RULES OF THIS VERSION
+// This version keeps the original block order in output files,
+// embeds metadata into one selected block, and performs decode
+// using only:
+//
+//   1) encode.txt
+//   2) metadata.txt
+//
+// No input/index file is required for decode.
+//
+// MAIN RULES OF THIS VERSION
 // ----------------------------------------------------------
-// 1) We do NOT start from the smallest number.
-//    The smallest value stays unchanged.
-//    Encoding starts from the 2nd smallest value.
+// 1) All values are sorted in ascending order only for GAP
+//    selection and linear rank-based encoding.
 //
-// 2) GAP is selected with:
-//      GAP = min(active_min_gap - 2, start_value / active_count)
+// 2) The closest adjacent sorted pair is selected:
 //
-//    where:
-//      active_count   = number of values from START_INDEX to end
-//      start_value    = sorted[START_INDEX]
-//      active_min_gap = minimum adjacent gap inside active region
+//      raw_gap = min(sorted[i+1] - sorted[i])
 //
-// 3) Encode on ascending order:
+//    This pair becomes the source pair.
 //
-//      for active rank r = 0,1,2,...:
-//          shift = (r+1) * GAP
-//          y = x - shift
+// 3) The operational GAP is:
 //
-// 4) Decode:
+//      GAP = raw_gap - 2
 //
-//      x = y + shift
+// 4) Encoding is linear by sorted rank:
+//
+//      shift(rank) = (rank + 1) * GAP
+//      y = x - shift(rank)
+//
+//    where rank starts from 0 in ascending sorted order.
+//
+// 5) One block of the selected source pair is used as the
+//    metadata host block.
+//
+// 6) The metadata host block stores:
+//    - GAP
+//    - companion block original position
+//
+//    These are packed into the same 256-bit block.
+//
+// 7) metadata.txt stores only the original position of the
+//    metadata host block.
+//
+//    Its width is dynamic:
+//
+//      position_bits = ceil(log2(COUNT))
+//
+// 8) input.txt and encode.txt are written in ORIGINAL block
+//    order, not sorted order.
+//
+// 9) Before decode starts, the selected source pair is restored
+//    to its old encoded form:
+//
+//      old_low_output = high_output - 2
+//
+//    This works because the selected source pair was encoded so
+//    that its old encoded difference is exactly 2.
+//
+// 10) After restoring the selected pair, the decoder rebuilds
+//     the rank order in memory by sorting the restored encoded
+//     values.
+//
+// 11) Normal decode then continues with:
+//
+//      x = y + shift(rank)
+//
+//     using the recovered GAP.
 //
 // EXTRA FILES
 // ----------------------------------------------------------
-// input.txt  : plain input bit strings, one per line
-// encode.txt : plain encoded bit strings, one per line
+// input.txt
+//   Original values as plain 256-bit binary strings, one per line.
+//
+// encode.txt
+//   Encoded values as plain 256-bit binary strings, one per line,
+//   written in original block order.
+//
+// metadata.txt
+//   Stores only the original position of the metadata host block.
+//   Bit width is dynamic and depends on COUNT.
+//
+// gap.txt
+//   Stores technical GAP information, source-pair positions,
+//   raw_gap, GAP, and related encoded values.
+//
+// space.txt
+//   Stores detailed transformation records for debugging and
+//   inspection.
+//
+// smallest_two_outputs.txt
+//   Stores the two smallest encoded outputs.
 //
 // DECODE MODE
 // ----------------------------------------------------------
@@ -46,8 +111,13 @@
 // or
 // program -d <source_bits_file> <decoded_output_file>
 //
-// Decode mode reads GAP from metadata.txt and decodes the bit
-// strings in the given source file into the given output file.
+// Decode flow:
+// 1) read metadata host position from metadata.txt
+// 2) read GAP + companion position from the metadata host block
+// 3) restore the selected source pair
+// 4) sort restored encoded outputs in memory
+// 5) perform normal decode
+// 6) write decoded values in original block order
 // ==========================================================
 
 use num_bigint::{BigUint, RandBigInt};
@@ -61,7 +131,6 @@ use std::path::Path;
 
 const BIT_WIDTH: u64 = 256;
 const COUNT: usize = 10_000;
-const START_INDEX: usize = 1; // 0 => en küçükten başla, 1 => 2. en küçükten başla
 const OUTPUT_FILE: &str = "space.txt";
 const METADATA_FILE: &str = "metadata.txt";
 const SMALLEST_TWO_OUTPUTS_FILE: &str = "smallest_two_outputs.txt";
@@ -70,21 +139,28 @@ const INPUT_BITS_FILE: &str = "input.txt";
 const ENCODE_BITS_FILE: &str = "encode.txt";
 
 #[derive(Clone, Debug)]
-struct EncodedRecord {
+struct SortedValue {
+    sorted_rank: usize,
     orig_index: usize,
     x: BigUint,
-    y: BigUint,
-    shift: BigUint,
-    active_rank: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
-struct DecodedRecord {
+struct EncodedRecord {
+    sorted_rank: usize,
     orig_index: usize,
-    y: BigUint,
     x: BigUint,
     shift: BigUint,
-    active_rank: Option<usize>,
+    is_metadata_host: bool,
+    is_source_companion: bool,
+}
+
+fn bits_needed_for_count(count: usize) -> u64 {
+    if count <= 1 {
+        1
+    } else {
+        (usize::BITS - (count - 1).leading_zeros()) as u64
+    }
 }
 
 fn to_bits(n: &BigUint, width: u64) -> String {
@@ -101,7 +177,7 @@ fn to_bits(n: &BigUint, width: u64) -> String {
 
 fn from_bits(s: &str) -> Result<BigUint, String> {
     BigUint::parse_bytes(s.trim().as_bytes(), 2)
-        .ok_or_else(|| format!("Geçersiz bit dizisi: {}", s.trim()))
+        .ok_or_else(|| format!("Invalid bit string: {}", s.trim()))
 }
 
 fn rand_bits(bit_width: u64, rng: &mut OsRng) -> BigUint {
@@ -123,188 +199,251 @@ fn generate_unique_values(count: usize, bit_width: u64) -> Vec<BigUint> {
     out
 }
 
-fn sorted_values(values: &[BigUint]) -> Vec<BigUint> {
-    let mut v = values.to_vec();
-    v.sort();
-    v
-}
+fn sorted_values(values: &[BigUint]) -> Vec<SortedValue> {
+    let mut pairs: Vec<(usize, BigUint)> = values.iter().cloned().enumerate().collect();
+    pairs.sort_by_key(|(_, v)| v.clone());
 
-fn compute_differences(sorted: &[BigUint]) -> Vec<BigUint> {
-    let mut diffs = Vec::with_capacity(sorted.len().saturating_sub(1));
-    for i in 1..sorted.len() {
-        diffs.push(&sorted[i] - &sorted[i - 1]);
-    }
-    diffs
-}
-
-// ----------------------------------------------------------
-// Compute reversible GAP using min_gap - 2 on active region
-// ----------------------------------------------------------
-fn compute_metadata(sorted: &[BigUint], start_index: usize) -> Result<(BigUint, BigUint, Vec<BigUint>), String> {
-    if sorted.len() < 2 {
-        return Err("En az 2 sayı gerekli.".to_string());
-    }
-
-    if start_index >= sorted.len() {
-        return Err(format!(
-            "Geçersiz START_INDEX. start_index={}, len={}",
-            start_index,
-            sorted.len()
-        ));
-    }
-
-    let active_count = sorted.len() - start_index;
-    if active_count == 0 {
-        return Err("Aktif bölge boş.".to_string());
-    }
-
-    let all_diffs = compute_differences(sorted);
-
-    if active_count == 1 {
-        return Err("Aktif bölgede en az 2 sayı gerekli.".to_string());
-    }
-
-    let active_diffs = all_diffs[start_index..].to_vec();
-    let active_min_gap = active_diffs
-        .iter()
-        .min()
-        .cloned()
-        .ok_or_else(|| "Aktif min_gap hesaplanamadı.".to_string())?;
-
-    let two = BigUint::from(2u32);
-    if active_min_gap <= two {
-        return Err(format!(
-            "Güvenli GAP üretilemedi. aktif min_gap={} <= 2",
-            active_min_gap
-        ));
-    }
-
-    let gap_by_order = &active_min_gap - 2u32;
-    let start_value = sorted[start_index].clone();
-    let gap_by_value = &start_value / BigUint::from(active_count as u64);
-
-    let gap = if gap_by_order < gap_by_value {
-        gap_by_order
-    } else {
-        gap_by_value
-    };
-
-    if gap.is_zero() {
-        return Err(format!(
-            "Metadata GAP sıfır oldu. start_value={}, active_count={}",
-            start_value, active_count
-        ));
-    }
-
-    Ok((active_min_gap, gap, all_diffs))
-}
-
-fn build_gap_shifts(total_count: usize, start_index: usize, gap: &BigUint) -> Vec<BigUint> {
-    (0..total_count)
-        .map(|i| {
-            if i < start_index {
-                BigUint::zero()
-            } else {
-                let active_rank = i - start_index;
-                BigUint::from((active_rank + 1) as u64) * gap
-            }
+    pairs
+        .into_iter()
+        .enumerate()
+        .map(|(sorted_rank, (orig_index, x))| SortedValue {
+            sorted_rank,
+            orig_index,
+            x,
         })
         .collect()
 }
 
-// ----------------------------------------------------------
-// Encode values using ascending order and active-region shifts
-// ----------------------------------------------------------
-fn encode(
-    values: &[BigUint],
-    shifts: &[BigUint],
-) -> Result<(Vec<BigUint>, bool, Vec<EncodedRecord>), String> {
-    let mut sorted_pairs: Vec<(usize, BigUint)> = values.iter().cloned().enumerate().collect();
-    sorted_pairs.sort_by_key(|(_, v)| v.clone());
+fn compute_gap_source(sorted: &[SortedValue]) -> Result<(usize, usize, BigUint, BigUint), String> {
+    if sorted.len() < 2 {
+        return Err("At least 2 numbers are required.".to_string());
+    }
 
-    let mut asc_encoded: Vec<EncodedRecord> = Vec::with_capacity(values.len());
+    let mut best_left = 0usize;
+    let mut best_right = 1usize;
+    let mut best_raw_gap = &sorted[1].x - &sorted[0].x;
 
-    for (sorted_rank, ((orig_index, x), s)) in sorted_pairs.into_iter().zip(shifts.iter()).enumerate() {
-        if x < *s {
+    for i in 1..sorted.len() - 1 {
+        let diff = &sorted[i + 1].x - &sorted[i].x;
+        if diff < best_raw_gap {
+            best_raw_gap = diff;
+            best_left = i;
+            best_right = i + 1;
+        }
+    }
+
+    let two = BigUint::from(2u32);
+    if best_raw_gap <= two {
+        return Err(format!("Safe GAP cannot be produced. raw_gap={} <= 2", best_raw_gap));
+    }
+
+    let gap = &best_raw_gap - 2u32;
+
+    for (i, sv) in sorted.iter().enumerate() {
+        let shift = BigUint::from((i + 1) as u64) * &gap;
+        if sv.x < shift {
             return Err(format!(
-                "Encode başarısız: x < shift. x={}, shift={}",
-                x, s
+                "Underflow risk at sorted rank {}: value {} is less than shift {}",
+                i, sv.x, shift
             ));
         }
+    }
 
-        let y = &x - s;
-        let active_rank = if s.is_zero() { None } else { Some(sorted_rank - START_INDEX) };
+    Ok((best_left, best_right, best_raw_gap, gap))
+}
 
-        asc_encoded.push(EncodedRecord {
-            orig_index,
-            x,
-            y,
-            shift: s.clone(),
-            active_rank,
+fn build_shifts(count: usize, gap: &BigUint) -> Vec<BigUint> {
+    (0..count)
+        .map(|i| BigUint::from((i + 1) as u64) * gap)
+        .collect()
+}
+
+fn encode_sorted(
+    sorted: &[SortedValue],
+    shifts: &[BigUint],
+    source_left_sorted_pos: usize,
+    source_right_sorted_pos: usize,
+) -> Result<(Vec<BigUint>, Vec<EncodedRecord>, bool), String> {
+    let mut outputs = Vec::with_capacity(sorted.len());
+    let mut records = Vec::with_capacity(sorted.len());
+
+    for (sv, shift) in sorted.iter().zip(shifts.iter()) {
+        if sv.x < *shift {
+            return Err(format!("Encode failed: x < shift. x={}, shift={}", sv.x, shift));
+        }
+
+        let y = &sv.x - shift;
+        outputs.push(y.clone());
+        records.push(EncodedRecord {
+            sorted_rank: sv.sorted_rank,
+            orig_index: sv.orig_index,
+            x: sv.x.clone(),
+            shift: shift.clone(),
+            is_metadata_host: sv.sorted_rank == source_left_sorted_pos,
+            is_source_companion: sv.sorted_rank == source_right_sorted_pos,
         });
     }
 
-    let order_ok = asc_encoded.windows(2).all(|w| w[0].y < w[1].y);
-
-    let mut by_input_order = asc_encoded.clone();
-    by_input_order.sort_by_key(|r| r.orig_index);
-    let outputs = by_input_order.iter().map(|r| r.y.clone()).collect();
-
-    Ok((outputs, order_ok, by_input_order))
+    let order_ok = outputs.windows(2).all(|w| w[0] < w[1]);
+    Ok((outputs, records, order_ok))
 }
 
-// ----------------------------------------------------------
-// Decode values by reconstructing active-region shifts
-// ----------------------------------------------------------
-fn decode(outputs: &[BigUint], shifts: &[BigUint]) -> (Vec<BigUint>, Vec<DecodedRecord>) {
-    let mut sorted_pairs: Vec<(usize, BigUint)> = outputs.iter().cloned().enumerate().collect();
-    sorted_pairs.sort_by_key(|(_, v)| v.clone());
+fn reorder_to_original_order<T: Clone>(sorted: &[SortedValue], values_in_sorted_order: &[T]) -> Vec<T> {
+    let mut pairs: Vec<(usize, T)> = sorted
+        .iter()
+        .zip(values_in_sorted_order.iter().cloned())
+        .map(|(sv, value)| (sv.orig_index, value))
+        .collect();
+    pairs.sort_by_key(|(orig_index, _)| *orig_index);
+    pairs.into_iter().map(|(_, value)| value).collect()
+}
 
-    let mut asc_decoded: Vec<DecodedRecord> = Vec::with_capacity(outputs.len());
+fn pack_metadata_block(gap: &BigUint, companion_orig_index: usize, pos_bits: u64) -> Result<BigUint, String> {
+    let companion = BigUint::from(companion_orig_index as u64);
+    let max_pos = BigUint::from(1u32) << pos_bits;
 
-    for (sorted_rank, ((orig_index, y), s)) in sorted_pairs.into_iter().zip(shifts.iter()).enumerate() {
-        let x = &y + s;
-        let active_rank = if s.is_zero() { None } else { Some(sorted_rank - START_INDEX) };
-
-        asc_decoded.push(DecodedRecord {
-            orig_index,
-            y,
-            x,
-            shift: s.clone(),
-            active_rank,
-        });
+    if companion >= max_pos {
+        return Err(format!(
+            "Companion position {} does not fit in {} bits.",
+            companion_orig_index, pos_bits
+        ));
     }
 
-    let mut by_input_order = asc_decoded.clone();
-    by_input_order.sort_by_key(|r| r.orig_index);
-    let restored = by_input_order.iter().map(|r| r.x.clone()).collect();
+    let packed = (gap << pos_bits) | companion;
 
-    (restored, by_input_order)
+    if packed.bits() > BIT_WIDTH {
+        return Err(format!(
+            "Packed metadata block exceeds {} bits. packed_bits={}",
+            BIT_WIDTH,
+            packed.bits()
+        ));
+    }
+
+    Ok(packed)
 }
 
-fn write_metadata(
-    metadata: &BigUint,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::create(METADATA_FILE)?;
-    let mut writer = BufWriter::new(file);
+fn unpack_metadata_block(packed: &BigUint, pos_bits: u64) -> Result<(BigUint, usize), String> {
+    let mask = (BigUint::from(1u32) << pos_bits) - 1u32;
+    let companion = packed & &mask;
+    let gap = packed >> pos_bits;
 
-    writeln!(writer, "{}", to_bits(metadata, BIT_WIDTH))?;
+    if gap.is_zero() {
+        return Err("Recovered GAP is zero.".to_string());
+    }
 
+    let digits = companion.to_u64_digits();
+    let companion_pos = if digits.is_empty() { 0 } else { digits[0] as usize };
+
+    Ok((gap, companion_pos))
+}
+
+fn embed_metadata_into_host(
+    outputs_in_original_order: &mut [BigUint],
+    metadata_host_orig_index: usize,
+    gap: &BigUint,
+    source_companion_orig_index: usize,
+    pos_bits: u64,
+) -> Result<(), String> {
+    let packed = pack_metadata_block(gap, source_companion_orig_index, pos_bits)?;
+    outputs_in_original_order[metadata_host_orig_index] = packed;
     Ok(())
 }
 
-fn write_plain_bits(path: &str, values: &[BigUint]) -> Result<(), Box<dyn std::error::Error>> {
+fn restore_selected_pair_before_decode(
+    outputs_in_original_order: &mut [BigUint],
+    metadata_host_orig_index: usize,
+    pos_bits: u64,
+) -> Result<(BigUint, usize), String> {
+    if metadata_host_orig_index >= outputs_in_original_order.len() {
+        return Err(format!("Invalid metadata host index: {}", metadata_host_orig_index));
+    }
+
+    let packed = outputs_in_original_order[metadata_host_orig_index].clone();
+    let (gap, source_companion_orig_index) = unpack_metadata_block(&packed, pos_bits)?;
+
+    if source_companion_orig_index >= outputs_in_original_order.len() {
+        return Err(format!(
+            "Recovered companion index {} is out of range.",
+            source_companion_orig_index
+        ));
+    }
+
+    if metadata_host_orig_index == source_companion_orig_index {
+        return Err("Metadata host and source companion cannot be the same block.".to_string());
+    }
+
+    let high_output = outputs_in_original_order[source_companion_orig_index].clone();
+    if high_output < BigUint::from(2u32) {
+        return Err("High output is too small to restore the pair with -2.".to_string());
+    }
+
+    let restored_low_old_output = &high_output - 2u32;
+    outputs_in_original_order[metadata_host_orig_index] = restored_low_old_output;
+
+    Ok((gap, source_companion_orig_index))
+}
+
+fn decode_from_restored_outputs_in_original_order(
+    restored_outputs_in_original_order: &[BigUint],
+    gap: &BigUint,
+) -> Vec<BigUint> {
+    let mut pairs: Vec<(usize, BigUint)> = restored_outputs_in_original_order
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect();
+
+    pairs.sort_by_key(|(_, y)| y.clone());
+
+    let mut restored_in_original_order = vec![BigUint::zero(); restored_outputs_in_original_order.len()];
+
+    for (sorted_rank, (orig_index, y)) in pairs.into_iter().enumerate() {
+        let x = y + BigUint::from((sorted_rank + 1) as u64) * gap;
+        restored_in_original_order[orig_index] = x;
+    }
+
+    restored_in_original_order
+}
+
+fn write_metadata_host_pos(pos: usize, pos_bits: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::create(METADATA_FILE)?;
+    let mut writer = BufWriter::new(file);
+    let pos_big = BigUint::from(pos as u64);
+    writeln!(writer, "{}", to_bits(&pos_big, pos_bits))?;
+    Ok(())
+}
+
+fn read_metadata_host_pos(path: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = from_bits(trimmed)?;
+        let digits = value.to_u64_digits();
+        let pos = if digits.is_empty() { 0 } else { digits[0] as usize };
+        return Ok(pos);
+    }
+
+    Err("metadata.txt is empty.".into())
+}
+
+fn write_plain_bits(path: &str, values: &[BigUint], width: u64) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
     for value in values {
-        writeln!(writer, "{}", to_bits(value, BIT_WIDTH))?;
+        writeln!(writer, "{}", to_bits(value, width))?;
     }
 
     Ok(())
 }
 
-fn read_plain_bits(path: &str) -> Result<Vec<BigUint>, Box<dyn std::error::Error>> {
+fn read_plain_bits(path: &str, width: u64) -> Result<Vec<BigUint>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut values = Vec::new();
@@ -317,22 +456,17 @@ fn read_plain_bits(path: &str) -> Result<Vec<BigUint>, Box<dyn std::error::Error
             continue;
         }
 
-        if trimmed.len() != BIT_WIDTH as usize {
+        if trimmed.len() != width as usize {
             return Err(format!(
-                "Geçersiz bit uzunluğu. satır={}, uzunluk={}, beklenen={}",
+                "Invalid bit length. line={}, length={}, expected={}",
                 line_no + 1,
                 trimmed.len(),
-                BIT_WIDTH
-            )
-            .into());
+                width
+            ).into());
         }
 
         if !trimmed.bytes().all(|b| b == b'0' || b == b'1') {
-            return Err(format!(
-                "Geçersiz karakter içeren bit dizisi. satır={}",
-                line_no + 1
-            )
-            .into());
+            return Err(format!("Invalid character in bit string. line={}", line_no + 1).into());
         }
 
         values.push(from_bits(trimmed)?);
@@ -341,35 +475,19 @@ fn read_plain_bits(path: &str) -> Result<Vec<BigUint>, Box<dyn std::error::Error
     Ok(values)
 }
 
-fn read_metadata_bits(path: &str) -> Result<BigUint, Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        return Ok(from_bits(trimmed)?);
-    }
-
-    Err("metadata.txt boş.".into())
-}
-
-fn write_smallest_two_outputs(outputs: &[BigUint]) -> Result<(), Box<dyn std::error::Error>> {
+fn write_smallest_two_outputs(outputs_in_original_order: &[BigUint]) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::create(SMALLEST_TWO_OUTPUTS_FILE)?;
     let mut writer = BufWriter::new(file);
 
-    let mut sorted = outputs.to_vec();
+    let mut sorted = outputs_in_original_order.to_vec();
     sorted.sort();
 
     let take_n = sorted.len().min(2);
 
     writeln!(writer, "DATE          : 2026-04-21")?;
     writeln!(writer, "BIT_WIDTH     : {}", BIT_WIDTH)?;
-    writeln!(writer, "COUNT         : {}", outputs.len())?;
-    writeln!(writer, "FIELD         : smallest 2 full OUT values")?;
+    writeln!(writer, "COUNT         : {}", outputs_in_original_order.len())?;
+    writeln!(writer, "FIELD         : smallest 2 encoded values in original block order output set")?;
     writeln!(writer)?;
 
     for (i, value) in sorted.iter().take(take_n).enumerate() {
@@ -382,79 +500,107 @@ fn write_smallest_two_outputs(outputs: &[BigUint]) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-fn write_gap(outputs: &[BigUint]) -> Result<(), Box<dyn std::error::Error>> {
+fn write_gap(
+    source_left_sorted_pos: usize,
+    source_right_sorted_pos: usize,
+    source_left_orig_index: usize,
+    source_right_orig_index: usize,
+    raw_gap: &BigUint,
+    gap: &BigUint,
+    pos_bits: u64,
+    encoded_outputs_in_sorted_order_before_embed: &[BigUint],
+    encoded_outputs_in_original_order_after_embed: &[BigUint],
+) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::create(GAP_FILE)?;
     let mut writer = BufWriter::new(file);
 
-    let mut sorted = outputs.to_vec();
-    sorted.sort();
-
-    if sorted.len() < 2 {
-        return Err("Yeterli veri yok.".into());
-    }
-
-    let first = &sorted[0];
-    let second = &sorted[1];
-    let gap = second - first;
-
-    writeln!(writer, "FIRST_OUT_DEC  : {}", first)?;
-    writeln!(writer, "SECOND_OUT_DEC : {}", second)?;
-    writeln!(writer, "GAP_DEC        : {}", gap)?;
+    writeln!(writer, "SOURCE_LEFT_SORTED_POS      : {}", source_left_sorted_pos)?;
+    writeln!(writer, "SOURCE_RIGHT_SORTED_POS     : {}", source_right_sorted_pos)?;
+    writeln!(writer, "SOURCE_LEFT_ORIG_INDEX      : {}", source_left_orig_index)?;
+    writeln!(writer, "SOURCE_RIGHT_ORIG_INDEX     : {}", source_right_orig_index)?;
+    writeln!(writer, "METADATA_HOST_ORIG_INDEX    : {}", source_left_orig_index)?;
+    writeln!(writer, "SOURCE_COMPANION_ORIG_INDEX : {}", source_right_orig_index)?;
+    writeln!(writer, "POSITION_BITS               : {}", pos_bits)?;
+    writeln!(writer, "RAW_GAP_DEC                 : {}", raw_gap)?;
+    writeln!(writer, "GAP_DEC                     : {}", gap)?;
     writeln!(writer)?;
-    writeln!(writer, "FIRST_OUT_BITS  : {}", to_bits(first, BIT_WIDTH))?;
-    writeln!(writer, "SECOND_OUT_BITS : {}", to_bits(second, BIT_WIDTH))?;
+    writeln!(
+        writer,
+        "SOURCE_LEFT_OLD_OUT_DEC     : {}",
+        encoded_outputs_in_sorted_order_before_embed[source_left_sorted_pos]
+    )?;
+    writeln!(
+        writer,
+        "SOURCE_RIGHT_OLD_OUT_DEC    : {}",
+        encoded_outputs_in_sorted_order_before_embed[source_right_sorted_pos]
+    )?;
+    writeln!(
+        writer,
+        "SOURCE_PAIR_OLD_DIFF_DEC    : {}",
+        &encoded_outputs_in_sorted_order_before_embed[source_right_sorted_pos]
+            - &encoded_outputs_in_sorted_order_before_embed[source_left_sorted_pos]
+    )?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "METADATA_HOST_NEW_OUT_DEC   : {}",
+        encoded_outputs_in_original_order_after_embed[source_left_orig_index]
+    )?;
+    writeln!(
+        writer,
+        "SOURCE_COMPANION_NEW_OUT_DEC: {}",
+        encoded_outputs_in_original_order_after_embed[source_right_orig_index]
+    )?;
 
     Ok(())
 }
 
 fn write_space(
-    values: &[BigUint],
-    outputs: &[BigUint],
-    encoded_records: &[EncodedRecord],
-    restored: &[BigUint],
+    sorted: &[SortedValue],
+    encoded_records_in_sorted_order: &[EncodedRecord],
+    outputs_in_original_order_after_embed: &[BigUint],
+    restored_in_original_order: &[BigUint],
     gap: &BigUint,
-    active_min_gap: &BigUint,
-    order_ok: bool,
+    metadata_host_orig_index: usize,
+    source_companion_orig_index: usize,
+    pos_bits: u64,
+    order_ok_before_embed: bool,
     reversible_ok: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::create(OUTPUT_FILE)?;
     let mut writer = BufWriter::new(file);
 
-    writeln!(writer, "DATE            : 2026-04-21")?;
-    writeln!(writer, "ORDER_OK        : {}", order_ok)?;
-    writeln!(writer, "REVERSIBLE_OK   : {}", reversible_ok)?;
-    writeln!(writer, "COUNT           : {}", values.len())?;
-    writeln!(writer, "BIT_WIDTH       : {}", BIT_WIDTH)?;
-    writeln!(writer, "START_INDEX     : {}", START_INDEX)?;
-    writeln!(writer, "ACTIVE_MIN_GAP  : {}", active_min_gap)?;
-    writeln!(writer, "GAP             : {}", gap)?;
+    writeln!(writer, "DATE                        : 2026-04-21")?;
+    writeln!(writer, "ORDER_OK_BEFORE_EMBED       : {}", order_ok_before_embed)?;
+    writeln!(writer, "REVERSIBLE_OK               : {}", reversible_ok)?;
+    writeln!(writer, "COUNT                       : {}", sorted.len())?;
+    writeln!(writer, "BIT_WIDTH                   : {}", BIT_WIDTH)?;
+    writeln!(writer, "POSITION_BITS               : {}", pos_bits)?;
+    writeln!(writer, "GAP                         : {}", gap)?;
+    writeln!(writer, "METADATA_HOST_ORIG_INDEX    : {}", metadata_host_orig_index)?;
+    writeln!(writer, "SOURCE_COMPANION_ORIG_INDEX : {}", source_companion_orig_index)?;
     writeln!(writer)?;
 
-    for i in 0..values.len() {
-        writeln!(writer, "INDEX       : {}", i)?;
-        writeln!(writer, "IN_DEC      : {}", values[i])?;
-        writeln!(writer, "OUT_DEC     : {}", outputs[i])?;
-        if order_ok {
-            writeln!(writer, "BACK_DEC    : {}", restored[i])?;
-        } else {
-            writeln!(writer, "BACK_DEC    : FAILED_ORDER_CHECK")?;
-        }
+    let records_in_original_order = reorder_to_original_order(sorted, encoded_records_in_sorted_order);
 
-        writeln!(writer, "IN_BITS     : {}", to_bits(&values[i], BIT_WIDTH))?;
-        writeln!(writer, "OUT_BITS    : {}", to_bits(&outputs[i], BIT_WIDTH))?;
-        if order_ok {
-            writeln!(writer, "BACK_BITS   : {}", to_bits(&restored[i], BIT_WIDTH))?;
+    for i in 0..records_in_original_order.len() {
+        let rec = &records_in_original_order[i];
+        writeln!(writer, "ORIG_INDEX    : {}", i)?;
+        writeln!(writer, "SORTED_RANK   : {}", rec.sorted_rank)?;
+        writeln!(writer, "IN_DEC        : {}", rec.x)?;
+        writeln!(writer, "OUT_DEC       : {}", outputs_in_original_order_after_embed[i])?;
+        writeln!(writer, "BACK_DEC      : {}", restored_in_original_order[i])?;
+        writeln!(writer, "SHIFT         : {}", rec.shift)?;
+        if rec.is_metadata_host {
+            writeln!(writer, "ROLE          : METADATA_HOST")?;
+        } else if rec.is_source_companion {
+            writeln!(writer, "ROLE          : SOURCE_COMPANION")?;
         } else {
-            writeln!(writer, "BACK_BITS   : FAILED_ORDER_CHECK")?;
+            writeln!(writer, "ROLE          : NORMAL")?;
         }
-
-        writeln!(writer, "SHIFT       : {}", encoded_records[i].shift)?;
-        match encoded_records[i].active_rank {
-            Some(rank) => writeln!(writer, "ACTIVE_RANK : {}", rank)?,
-            None => writeln!(writer, "ACTIVE_RANK : NONE")?,
-        }
-        writeln!(writer, "ORIG_X      : {}", encoded_records[i].x)?;
-        writeln!(writer, "ENC_Y       : {}", encoded_records[i].y)?;
+        writeln!(writer, "IN_BITS       : {}", to_bits(&rec.x, BIT_WIDTH))?;
+        writeln!(writer, "OUT_BITS      : {}", to_bits(&outputs_in_original_order_after_embed[i], BIT_WIDTH))?;
+        writeln!(writer, "BACK_BITS     : {}", to_bits(&restored_in_original_order[i], BIT_WIDTH))?;
         writeln!(writer, "{}", "-".repeat(120))?;
     }
 
@@ -463,106 +609,135 @@ fn write_space(
 
 fn run_encode_mode() -> Result<(), Box<dyn std::error::Error>> {
     let values = generate_unique_values(COUNT, BIT_WIDTH);
+    let sorted = sorted_values(&values);
+    let pos_bits = bits_needed_for_count(COUNT);
 
-    let asc_sorted = sorted_values(&values);
-    let (active_min_gap, metadata_gap, _diffs) = compute_metadata(&asc_sorted, START_INDEX)?;
-    let shifts = build_gap_shifts(COUNT, START_INDEX, &metadata_gap);
+    let (source_left_sorted_pos, source_right_sorted_pos, raw_gap, gap) =
+        compute_gap_source(&sorted).map_err(|e| format!("Gap source error: {}", e))?;
 
-    let (outputs, order_ok, encoded_records) =
-        encode(&values, &shifts).map_err(|e| format!("Encode hatası: {}", e))?;
+    let shifts = build_shifts(sorted.len(), &gap);
+    let (outputs_in_sorted_order_before_embed, encoded_records_in_sorted_order, order_ok_before_embed) =
+        encode_sorted(&sorted, &shifts, source_left_sorted_pos, source_right_sorted_pos)
+            .map_err(|e| format!("Encode error: {}", e))?;
 
-    let (restored, reversible_ok) = if order_ok {
-        let (restored, decoded_records) = decode(&outputs, &shifts);
-        let ok = restored == values;
-        let _decoded_records_guard = decoded_records
-            .iter()
-            .map(|r| (&r.y, &r.shift, &r.active_rank))
-            .collect::<Vec<_>>();
-        (restored, ok)
-    } else {
-        (vec![BigUint::zero(); values.len()], false)
-    };
+    let mut outputs_in_original_order =
+        reorder_to_original_order(&sorted, &outputs_in_sorted_order_before_embed);
 
-    let changed_count = values
+    let metadata_host_orig_index = sorted[source_left_sorted_pos].orig_index;
+    let source_companion_orig_index = sorted[source_right_sorted_pos].orig_index;
+
+    embed_metadata_into_host(
+        &mut outputs_in_original_order,
+        metadata_host_orig_index,
+        &gap,
+        source_companion_orig_index,
+        pos_bits,
+    ).map_err(|e| format!("Metadata embed error: {}", e))?;
+
+    let mut outputs_for_decode_in_original_order = outputs_in_original_order.clone();
+    let (recovered_gap, recovered_companion_pos) = restore_selected_pair_before_decode(
+        &mut outputs_for_decode_in_original_order,
+        metadata_host_orig_index,
+        pos_bits,
+    ).map_err(|e| format!("Pre-decode restore error: {}", e))?;
+
+    let restored_in_original_order =
+        decode_from_restored_outputs_in_original_order(&outputs_for_decode_in_original_order, &recovered_gap);
+
+    let reversible_ok = restored_in_original_order
         .iter()
-        .zip(outputs.iter())
-        .filter(|(a, b)| *a != *b)
-        .count();
+        .zip(values.iter())
+        .all(|(a, b)| a == b);
 
-    let same_count = COUNT - changed_count;
-
-    write_metadata(&metadata_gap)?;
-    write_smallest_two_outputs(&outputs)?;
-    write_gap(&outputs)?;
-    write_plain_bits(INPUT_BITS_FILE, &values)?;
-    write_plain_bits(ENCODE_BITS_FILE, &outputs)?;
+    write_metadata_host_pos(metadata_host_orig_index, pos_bits)?;
+    write_smallest_two_outputs(&outputs_in_original_order)?;
+    write_gap(
+        source_left_sorted_pos,
+        source_right_sorted_pos,
+        metadata_host_orig_index,
+        source_companion_orig_index,
+        &raw_gap,
+        &gap,
+        pos_bits,
+        &outputs_in_sorted_order_before_embed,
+        &outputs_in_original_order,
+    )?;
+    write_plain_bits(INPUT_BITS_FILE, &values, BIT_WIDTH)?;
+    write_plain_bits(ENCODE_BITS_FILE, &outputs_in_original_order, BIT_WIDTH)?;
     write_space(
-        &values,
-        &outputs,
-        &encoded_records,
-        &restored,
-        &metadata_gap,
-        &active_min_gap,
-        order_ok,
+        &sorted,
+        &encoded_records_in_sorted_order,
+        &outputs_in_original_order,
+        &restored_in_original_order,
+        &recovered_gap,
+        metadata_host_orig_index,
+        recovered_companion_pos,
+        pos_bits,
+        order_ok_before_embed,
         reversible_ok,
     )?;
 
     println!("Completed.");
-    println!("Date                      : 2026-04-21");
-    println!("Record count              : {}", COUNT);
-    println!("Bit width                 : {}", BIT_WIDTH);
-    println!("Start index               : {}", START_INDEX);
-    println!("Active min gap            : {}", active_min_gap);
-    println!("Metadata GAP              : {}", metadata_gap);
-    println!("Order preserved           : {}", order_ok);
-    println!("Reversible                : {}", reversible_ok);
-    println!("Changed records           : {}", changed_count);
-    println!("Unchanged records         : {}", same_count);
-    println!("metadata.txt              : {}", METADATA_FILE);
-    println!("space.txt                 : {}", OUTPUT_FILE);
-    println!("smallest_two_outputs.txt  : {}", SMALLEST_TWO_OUTPUTS_FILE);
-    println!("gap.txt                   : {}", GAP_FILE);
-    println!("input.txt                 : {}", INPUT_BITS_FILE);
-    println!("encode.txt                : {}", ENCODE_BITS_FILE);
+    println!("Date                         : 2026-04-21");
+    println!("Record count                 : {}", COUNT);
+    println!("Bit width                    : {}", BIT_WIDTH);
+    println!("Position bits                : {}", pos_bits);
+    println!("Metadata host original index : {}", metadata_host_orig_index);
+    println!("Recovered companion index    : {}", recovered_companion_pos);
+    println!("Metadata GAP                 : {}", recovered_gap);
+    println!("Order preserved before embed : {}", order_ok_before_embed);
+    println!("Reversible                   : {}", reversible_ok);
+    println!("metadata.txt                 : {}", METADATA_FILE);
+    println!("space.txt                    : {}", OUTPUT_FILE);
+    println!("smallest_two_outputs.txt     : {}", SMALLEST_TWO_OUTPUTS_FILE);
+    println!("gap.txt                      : {}", GAP_FILE);
+    println!("input.txt                    : {}", INPUT_BITS_FILE);
+    println!("encode.txt                   : {}", ENCODE_BITS_FILE);
 
     Ok(())
 }
 
 fn run_decode_mode(source_file: &str, output_file: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !Path::new(METADATA_FILE).exists() {
+        return Err(format!("{} is required for decode. Run normal encode first.", METADATA_FILE).into());
+    }
+
+    let outputs_in_original_order = read_plain_bits(source_file, BIT_WIDTH)?;
+    if outputs_in_original_order.len() < 2 {
+        return Err("Decode source must contain at least 2 blocks.".into());
+    }
+
+    let pos_bits = bits_needed_for_count(outputs_in_original_order.len());
+    let metadata_host_orig_index = read_metadata_host_pos(METADATA_FILE)?;
+    if metadata_host_orig_index >= outputs_in_original_order.len() {
         return Err(format!(
-            "Decode için {} gerekli. Önce normal encode çalıştırılmalı.",
-            METADATA_FILE
-        )
-        .into());
+            "Metadata host index {} is out of range for {} blocks.",
+            metadata_host_orig_index,
+            outputs_in_original_order.len()
+        ).into());
     }
 
-    let outputs = read_plain_bits(source_file)?;
-    if outputs.is_empty() {
-        return Err("Decode kaynağı boş.".into());
-    }
+    let mut outputs_for_decode_in_original_order = outputs_in_original_order.clone();
+    let (recovered_gap, recovered_companion_pos) = restore_selected_pair_before_decode(
+        &mut outputs_for_decode_in_original_order,
+        metadata_host_orig_index,
+        pos_bits,
+    ).map_err(|e| format!("Pre-decode restore error: {}", e))?;
 
-    let metadata_gap = read_metadata_bits(METADATA_FILE)?;
-    if metadata_gap.is_zero() {
-        return Err("metadata.txt içindeki GAP sıfır.".into());
-    }
+    let restored_in_original_order =
+        decode_from_restored_outputs_in_original_order(&outputs_for_decode_in_original_order, &recovered_gap);
 
-    let shifts = build_gap_shifts(outputs.len(), START_INDEX, &metadata_gap);
-    let (restored, decoded_records) = decode(&outputs, &shifts);
-    let _sanity = decoded_records
-        .iter()
-        .map(|r| (&r.orig_index, &r.y, &r.x, &r.shift, &r.active_rank))
-        .collect::<Vec<_>>();
-
-    write_plain_bits(output_file, &restored)?;
+    write_plain_bits(output_file, &restored_in_original_order, BIT_WIDTH)?;
 
     println!("Decode completed.");
-    println!("Source file               : {}", source_file);
-    println!("Output file               : {}", output_file);
-    println!("Record count              : {}", restored.len());
-    println!("Bit width                 : {}", BIT_WIDTH);
-    println!("Start index               : {}", START_INDEX);
-    println!("Metadata GAP              : {}", metadata_gap);
+    println!("Source file                  : {}", source_file);
+    println!("Output file                  : {}", output_file);
+    println!("Record count                 : {}", restored_in_original_order.len());
+    println!("Bit width                    : {}", BIT_WIDTH);
+    println!("Position bits                : {}", pos_bits);
+    println!("Metadata host original index : {}", metadata_host_orig_index);
+    println!("Recovered companion index    : {}", recovered_companion_pos);
+    println!("Recovered GAP                : {}", recovered_gap);
 
     Ok(())
 }
@@ -576,11 +751,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.len() != 1 {
         return Err(
-            "Kullanım:\n  program\n  program -d <kaynak_bit_dosyasi> <decode_cikti_dosyasi>"
+            "Usage:\n  program\n  program -d <source_bits_file> <decoded_output_file>"
                 .into(),
         );
     }
 
     run_encode_mode()
 }
-
