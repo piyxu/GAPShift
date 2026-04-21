@@ -5,7 +5,7 @@
 // Code implementation and enhancement assisted by ChatGPT.
 // Core principles developed in collaboration with Gemini.
 // https://github.com/piyxu/GAPShift/
-//GAPShift Version Update Version 0.1
+//GAPShift Version Update Version 0.1 
 
 // ==========================================================
 // CORE IDEA
