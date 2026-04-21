@@ -1,6 +1,7 @@
 # GAPShift: A Reversible Data Transformation
-
+#
 ## Overview
+"The code is currently in the logic development phase. Data may not be consistent with random inputs as testing is still ongoing."
 
 This project implements a reversible transformation over a set of 256-bit integers by **repositioning values within the numeric space using a deterministic GAP-based shifting system**.
 
