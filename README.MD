@@ -1,332 +1,381 @@
 # GAPShift
 
-GAPShift is a reversible transformation for 256-bit integers.
+GAPShift is an experimental reversible transformation for fixed-width integer blocks.
 
-In plain terms, it takes a collection of large numbers, shifts them in a controlled way, and later reconstructs the original values exactly. The method is deterministic, compact, and designed to keep metadata overhead low by embedding most of the recovery information directly into the encoded data.
+The current implementation works with **4096-bit blocks** and a default test size of **1000 blocks**. It transforms a set of large integer blocks by using the spacing between nearby values, embeds most recovery metadata directly into the encoded data, and can reconstruct the original input exactly.
 
-This project is not an encryption system and it is not a classical compression algorithm. Its purpose is to reorganize data inside the numeric space while preserving exact recoverability.
-
----
-
-## Why this project exists
-
-If we simply subtract arbitrary values from a dataset, recovery quickly becomes messy. We would normally have to store a lot of extra information to undo the transformation later.
-
-GAPShift takes a different route:
-
-- it looks at the internal spacing of the data,
-- derives one global step value from that structure,
-- applies a simple linear rule,
-- and keeps the information needed for recovery as small as possible.
-
-The interesting part is that the transformation remains fully reversible even though the metadata footprint is kept small.
+GAPShift is not an encryption system and it is not a standard compression algorithm. It is a reversible numeric-space transformation experiment.
 
 ---
 
-## High-level idea
-
-The workflow is built around one value called **GAP**.
-
-First, the numbers are sorted.  
-Then the algorithm finds the **closest adjacent pair** in that sorted order.  
-The distance between those two numbers is the raw local spacing:
+## Current defaults
 
 ```text
-raw_gap = sorted[i+1] - sorted[i]
+BIT_WIDTH = 4096
+COUNT     = 1000
 ```
 
-From that value, the operational step is defined as:
+Each block is written as a plain 4096-bit binary string, one block per line.
+
+---
+
+## Core idea
+
+The algorithm works around one value called **GAP**.
+
+For each encode pass:
+
+1. The blocks are sorted in memory.
+2. The closest adjacent pair is found.
+3. The raw distance is computed:
+
+```text
+raw_gap = sorted[i + 1] - sorted[i]
+```
+
+4. The operational GAP is computed as:
 
 ```text
 GAP = raw_gap - 2
 ```
 
-That single GAP value is then used across the whole sorted dataset.
-
-For a value at sorted rank `r`, the shift is:
+5. Each sorted block is shifted by rank:
 
 ```text
-shift(r) = (r + 1) * GAP
+shift(rank) = (rank + 1) * GAP
 ```
 
-and the encoded value becomes:
+6. The encoded value is:
 
 ```text
-y = x - shift(r)
+y = x - shift(rank)
 ```
 
-So the first sorted value is shifted by `1 * GAP`, the second by `2 * GAP`, the third by `3 * GAP`, and so on.
-
-This makes the system easy to reason about and easy to reverse.
-
----
-
-## Why `raw_gap - 2`?
-
-This small adjustment is what gives the system its recovery anchor.
-
-Suppose the closest adjacent pair is:
-
-```text
-15, 20
-```
-
-Then:
-
-```text
-raw_gap = 20 - 15 = 5
-GAP = 5 - 2 = 3
-```
-
-After encoding with consecutive shifts, the encoded distance of that pair becomes exactly `2`.
-
-That matters because one of those two blocks will later be reused as a metadata host. During decoding, the original encoded value of that overwritten block can be reconstructed with a very simple rule:
+The `raw_gap - 2` rule is important because it leaves the selected source pair with an encoded distance of exactly `2`. That gives the decoder a simple recovery anchor:
 
 ```text
 old_low_output = high_output - 2
 ```
 
-This is one of the key ideas in the design.
+---
+
+## Alternating view per repeat
+
+Repeat encoding alternates the way values are viewed for sorting and GAP selection.
+
+The actual stored blocks are not inverted. Only the internal comparison view changes:
+
+```text
+repeat 1: normal view
+repeat 2: inverted bit view
+repeat 3: normal view
+repeat 4: inverted bit view
+...
+```
+
+In inverted view, the algorithm behaves as if:
+
+```text
+view(x) = (2^4096 - 1) - x
+```
+
+This changes the internal ordering between repeat passes without modifying the real block data.
+
+Decode uses the repeat number from the filename and applies the same views in reverse order.
 
 ---
 
-## Metadata design
+## Metadata model
 
-The project tries to avoid storing large external metadata.
+Most metadata is stored inside the first encoded block.
 
-Instead of keeping GAP and block references in separate files, one selected encoded block becomes a **metadata host block**.
-
-That block stores:
-
-- the recovered `GAP`,
-- the original position of its companion block.
-
-These two values are packed into the same 256-bit block.
-
-Only one small external hint remains:
-
-### `metadata.txt`
-
-This file stores only the original position of the metadata host block.
-
-Its width is not fixed. It is calculated dynamically from the total number of records:
+For 1000 blocks, each block index needs 10 bits:
 
 ```text
-position_bits = ceil(log2(COUNT))
+metadata host index : 10 bits
+companion index     : 10 bits
+inline GAP space    : 4076 bits
 ```
 
-That means the metadata field grows only as much as needed.
+So the first block stores:
 
-Examples:
+```text
+10-bit metadata_host_index + 10-bit companion_index + 4076-bit GAP fragment
+```
 
-- `COUNT = 10,000` → `14` bits
-- `COUNT = 5,000,000` → `23` bits
-
-This makes the addressing part of the metadata scalable without wasting space.
+The metadata host block is moved to the first output position. Its original block index is stored inside that metadata block, so decode can restore the original order.
 
 ---
 
-## Important detail about block order
+## `metadata.txt`
 
-The transformation itself is defined on **sorted ranks**, but the exported files keep the **original block order**.
+`metadata.txt` is used only when GAP does not fully fit inside the inline 4076-bit GAP field.
 
-That means:
+If there is no GAP overflow, no useful metadata line is written for that repeat.
 
-- the algorithm sorts values internally to choose GAP and apply the rank-based shift,
-- but `input.txt` and `encode.txt` are written in the original record order.
+If GAP overflows, only the overflow bits are written.
 
-This is intentional. The system works with real block positions, not a rewritten sorted file layout.
+The file contains **only raw bit lines**:
+
+```text
+
+
+
+
+
+1
+```
+
+Blank lines mean that repeat stage had no external overflow bits. A non-empty line contains only the overflow bits for that repeat stage.
+
+No labels, numbers, or explanatory text are written into `metadata.txt`.
+
+During repeat decode, the decoder reads the line matching the current repeat pass and appends those overflow bits back above the inline GAP fragment.
 
 ---
 
-## Encode flow
+## Repeat encode
 
-The encoding stage can be summarized as follows:
-
-1. Generate or read the input values.
-2. Sort them in ascending order.
-3. Find the closest adjacent pair.
-4. Compute `GAP = raw_gap - 2`.
-5. Shift every sorted value according to its rank.
-6. Choose one block from the selected pair as the metadata host.
-7. Pack `GAP` and the companion block position into that host block.
-8. Write the final encoded data back in original block order.
-
----
-
-## Decode flow
-
-The decoder does not need the original input file to reconstruct the rank structure.
-
-It works from `encode.txt` and `metadata.txt` like this:
-
-1. Read the metadata host position from `metadata.txt`.
-2. Read the metadata host block from `encode.txt`.
-3. Extract:
-   - `GAP`
-   - companion block position
-4. Rebuild the overwritten source-pair value using:
-
-```text
-old_low_output = high_output - 2
-```
-
-5. Once the selected pair is restored, sort the encoded values **in memory**.
-6. Reconstruct the original numbers using:
-
-```text
-x = y + shift(rank)
-```
-
-7. Write the decoded values back in original block order.
-
-This keeps the external decode requirements small while still allowing the original order structure to be recovered.
-
----
-
-## A small example
-
-Take this sorted sequence:
-
-```text
-15
-20
-39
-```
-
-The closest adjacent pair is `15` and `20`.
-
-So:
-
-```text
-raw_gap = 5
-GAP = 3
-```
-
-Now apply the linear rule:
-
-```text
-15 -> 12
-20 -> 14
-39 -> 30
-```
-
-The encoded difference of the selected pair is now:
-
-```text
-14 - 12 = 2
-```
-
-If the lower block of that pair is later replaced with packed metadata, the decoder can still restore its old encoded value using the higher encoded output:
-
-```text
-old_low_output = 14 - 2 = 12
-```
-
-Then normal decode can continue.
-
-This example is small, but the same logic works for large 256-bit datasets.
-
----
-
-## Files produced by the program
-
-### `input.txt`
-Original values as plain 256-bit binary strings, one value per line.
-
-### `encode.txt`
-Encoded values as plain 256-bit binary strings, one value per line, written in original block order.
-
-### `metadata.txt`
-The original position of the metadata host block. The width is dynamic and depends on the number of blocks.
-
-### `gap.txt`
-Technical information about the selected source pair, `raw_gap`, `GAP`, and related encoded values.
-
-### `space.txt`
-A detailed debug-oriented record of the transformation, including roles, shifts, input values, encoded values, and decoded values.
-
-### `smallest_two_outputs.txt`
-The two smallest encoded outputs, written for quick inspection.
-
----
-
-## Decode mode
-
-You can decode with:
+Repeat mode can run until the transformation reaches a stopping condition:
 
 ```bash
-program -d <source_bits_file> <decoded_output_file>
+program -r <source_bits_file> <encoded_output_file>
 ```
 
 Example:
 
 ```bash
-program -d encode.txt decoded.txt
+program -r input.txt packed.txt
 ```
 
-The decoder will:
+If the last successful repeat is 6, only the final file is written:
 
-- find the metadata host,
-- recover `GAP` and the companion location,
-- restore the overwritten pair,
-- sort the encoded values in memory,
-- and reconstruct the original dataset.
+```text
+packed.6.txt
+```
+
+Intermediate repeat files are not written.
+
+A fixed repeat count can also be requested:
+
+```bash
+program -r <repeat_count> <source_bits_file> <encoded_output_file>
+```
+
+Example:
+
+```bash
+program -r 6 input.txt packed.txt
+```
+
+This writes only:
+
+```text
+packed.6.txt
+```
 
 ---
 
-## What this project is and is not
+## Repeat decode
+
+Repeat decode uses the repeat number embedded in the filename.
+
+```bash
+program -d <repeat_encoded_file> <decoded_output_file>
+```
+
+Example:
+
+```bash
+program -d packed.6.txt decoded.txt
+```
+
+The decoder sees `.6.` in the filename and runs the passes backward:
+
+```text
+repeat 6
+repeat 5
+repeat 4
+repeat 3
+repeat 2
+repeat 1
+```
+
+If `metadata.txt` exists, it must be in the same working directory when decoding, because GAP overflow bits may be needed for some repeat stages.
+
+---
+
+## Normal encode
+
+Without arguments, the program generates random unique input blocks and writes the default output:
+
+```bash
+program
+```
+
+This produces:
+
+```text
+input.txt
+encode.txt
+```
+
+You can also encode a specific source file:
+
+```bash
+program -e <source_bits_file> <encoded_output_file>
+```
+
+Example:
+
+```bash
+program -e input.txt encode.txt
+```
+
+---
+
+## Normal decode
+
+Single-pass decode:
+
+```bash
+program -d encode.txt decoded.txt
+```
+
+If the source filename does not contain a repeat number, decode assumes one pass.
+
+---
+
+## Files produced
+
+### `input.txt`
+
+Original random input blocks as 4096-bit binary strings.
+
+### `encode.txt`
+
+Single-pass encoded output.
+
+### `<name>.<repeat>.txt`
+
+Repeat encoded output. Only the final repeat file is written in repeat mode.
+
+### `metadata.txt`
+
+Optional overflow metadata. It contains only raw bit lines. Blank lines represent repeat stages with no GAP overflow.
+
+### `gap.txt`
+
+Debug information about the selected source pair, raw GAP, GAP, and related encoded values.
+
+### `space.txt`
+
+Detailed debug record of the transformation.
+
+### `smallest_two_outputs.txt`
+
+The two smallest encoded outputs for inspection.
+
+---
+
+## Entropy report
+
+The program prints compact entropy statistics from the in-memory block vectors:
+
+```text
+Input entropy
+Encoded entropy
+Decode source entropy
+Restored entropy
+```
+
+The report includes:
+
+```text
+entropy bits/bit
+ones count
+zeros count
+one percentage
+total bit count
+```
+
+No bit-output file needs to be read to compute this report.
+
+---
+
+## Proximity report
+
+The program also prints proximity statistics:
+
+```text
+min_gap
+min_gap/range
+avg_gap
+avg_gap/range
+distance to zero
+distance to top
+distance ratios
+```
+
+The range is:
+
+```text
+0 .. 2^4096 - 1
+```
+
+This helps show how close the generated or transformed values are to each other, to zero, and to the upper edge of the 4096-bit space.
+
+---
+
+## Reversibility
+
+The design goal is exact recovery.
+
+A successful encode pass performs an internal pre-decode check and prints:
+
+```text
+Reversible: true
+```
+
+For external validation, compare hashes of the original and decoded files:
+
+```powershell
+Compare-Object (Get-FileHash input.txt) (Get-FileHash decoded.txt) -Property Hash
+```
+
+An empty result means the files match exactly.
+
+---
+
+## What GAPShift is and is not
 
 GAPShift is:
 
 - deterministic,
 - reversible,
-- structured,
 - metadata-aware,
-- suitable for experiments in reversible data-space transformation.
+- suitable for experiments in numeric-space transformation,
+- able to repeat-transform data while preserving decode paths.
 
 GAPShift is not:
 
-- a cipher,
+- encryption,
 - a hash function,
 - a security primitive,
-- or a standard entropy-compression method.
+- or a standard compression method.
 
-It moves data in a disciplined way. It does not try to hide the existence of structure.
-
----
-
-## Design goals
-
-This implementation tries to balance three things:
-
-1. **reversibility** — the original data must be recovered exactly,
-2. **simplicity** — the core rule should stay understandable,
-3. **low metadata cost** — recovery data should be kept as small and local as possible.
-
-The current metadata-host design is the practical result of those goals.
+It reorganizes numeric structure while preserving exact recoverability.
 
 ---
 
 ## Limitations
 
-A few boundaries are worth stating clearly:
-
-- The method depends on a valid closest-pair source.
-- The chosen GAP must satisfy underflow safety for every sorted rank.
-- The metadata host block must remain readable and unchanged.
-- This design is structural, not cryptographic.
-- Very large stress tests may require careful review of metadata packing width, memory use, and file size.
-
-These are normal engineering limits, not hidden weaknesses.
-
----
-
-## Project status
-
-This repository is experimental and evolving. The core reversible logic is already in place, but metadata strategies, stress-test behavior, and packing schemes are still being refined.
-
-That is part of the purpose of the project: to explore how far a compact reversible transformation can go while staying simple enough to reason about.
+- A safe closest-pair GAP must exist.
+- The rank-based shift must not underflow in the selected view.
+- Decode needs the final repeat file.
+- Decode also needs `metadata.txt` if any repeat stage used GAP overflow bits.
+- The method is structural, not cryptographic.
+- Debug reports can be large when detailed files such as `space.txt` are enabled.
 
 ---
 
