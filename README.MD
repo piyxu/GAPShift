@@ -1,5 +1,5 @@
 # GAPShift
-
+THIS NEW CODE IS FOR TESTING. README FILE UNCHANGED.
 GAPShift is an experimental reversible transformation for fixed-width integer blocks.
 
 The current implementation works with **4096-bit blocks** and a default test size of **1000 blocks**. It transforms a set of large integer blocks by using the spacing between nearby values, embeds most recovery metadata directly into the encoded data, and can reconstruct the original input exactly.
