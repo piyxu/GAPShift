@@ -5,7 +5,7 @@
 // Code implementation and enhancement assisted by ChatGPT.
 // Core principles developed in collaboration with Gemini.
 // https://github.com/piyxu/GAPShift/
-//GAPShift Version Update Version 0.1.1 Test 
+// GAPShift Version Update Version 0.1.2 Test 
 // GAPShift pipeline overview
 //
 // 1. Input blocks are fixed-width 4096-bit unsigned integers.
@@ -18,16 +18,16 @@
 //    restored during decode with `companion_output - 2`.
 // 5. Every sorted block is shifted by `(rank + 1) * GAP`, then written back in
 //    original block order.
-// 6. The metadata host is moved to output slot 0. That block stores the host
-//    original index, companion index, and the low GAP bits.
-// 7. If GAP does not fit fully in the inline GAP field, only the high overflow
-//    bits are appended to `metadata.txt`. The file contains raw bit lines only;
-//    blank lines mean that repeat had no overflow.
-// 8. Repeat mode keeps intermediate passes in memory and writes only the final
-//    successful repeat file, named like `output.6.txt`.
-// 9. Decode reads the repeat count from the filename and reverses passes from
-//    N down to 1, using the matching view and metadata overflow line for each
-//    repeat.
+// 6. Experimental self-sum metadata mode keeps the metadata host in its own
+//    original slot. The host no longer stores its own index.
+// 7. The metadata payload stores only the source companion index and GAP:
+//    `payload = GAP * COUNT + companion_index`.
+// 8. The payload is added to the largest encoded value excluding the metadata
+//    host, then written into the metadata host slot. If this addition would
+//    exceed the fixed block width, the pass stops; metadata.txt is not used.
+// 9. Decode finds the largest output as the metadata host, subtracts the next
+//    largest output to recover the payload, restores the host from
+//    `companion_output - 2`, then reverses the rank shifts.
 // 10. The final decoded output should match the original input exactly.
 
 use num_bigint::{BigUint, RandBigInt};
@@ -35,18 +35,61 @@ use num_traits::Zero;
 use rand::rngs::OsRng;
 use std::collections::HashSet;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-const BIT_WIDTH: u64 = 4096;
-const COUNT: usize = 1000;
+const DEFAULT_BIT_WIDTH: u64 = 4096;
+const DEFAULT_COUNT: usize = 1000;
+
+#[derive(Clone, Copy, Debug)]
+struct Config {
+    bit_width: u64,
+    count: usize,
+    bit_width_explicit: bool,
+}
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+static ACTIVE_BIT_WIDTH: AtomicU64 = AtomicU64::new(0);
+
+fn config() -> &'static Config {
+    CONFIG.get().expect("Runtime config was not initialized.")
+}
+
+fn bit_width() -> u64 {
+    config().bit_width
+}
+
+fn active_bit_width() -> u64 {
+    let active = ACTIVE_BIT_WIDTH.load(Ordering::Relaxed);
+    if active == 0 {
+        bit_width()
+    } else {
+        active
+    }
+}
+
+fn max_value_bit_width(values: &[BigUint]) -> u64 {
+    values
+        .iter()
+        .map(|value| value.bits())
+        .max()
+        .unwrap_or(0)
+        .max(bit_width())
+        .max(1)
+}
+
+fn set_active_bit_width(width: u64) {
+    ACTIVE_BIT_WIDTH.store(width.max(bit_width()).max(1), Ordering::Relaxed);
+}
 const OUTPUT_FILE: &str = "space.txt";
 const SMALLEST_TWO_OUTPUTS_FILE: &str = "smallest_two_outputs.txt";
 const GAP_FILE: &str = "gap.txt";
 const INPUT_BITS_FILE: &str = "input.txt";
 const ENCODE_BITS_FILE: &str = "encode.txt";
-const METADATA_FILE: &str = "metadata.txt";
+const BITS_FILE: &str = "bits.txt";
 
 // A sorted value keeps both the real block (`x`) and the comparison key.
 // The key may be the bit-inverted view used on even repeat passes.
@@ -75,6 +118,13 @@ struct EntropyStats {
     entropy_per_bit: f64,
 }
 
+#[derive(Clone, Debug)]
+struct LeadingOnesReport {
+    repeat: usize,
+    leading_ones: u64,
+    largest_value: BigUint,
+}
+
 // All persisted block files use fixed-width binary strings.
 fn to_bits(n: &BigUint, width: u64) -> String {
     let s = n.to_str_radix(2);
@@ -86,6 +136,92 @@ fn to_bits(n: &BigUint, width: u64) -> String {
         out.push_str(&s);
         out
     }
+}
+
+fn leading_ones_count(value: &BigUint, width: u64) -> u64 {
+    to_bits(value, width)
+        .bytes()
+        .take_while(|bit| *bit == b'1')
+        .count() as u64
+}
+
+fn largest_value(values: &[BigUint]) -> Option<BigUint> {
+    values.iter().cloned().max()
+}
+
+fn collect_leading_ones_report(repeat: usize, values: &[BigUint]) -> Option<LeadingOnesReport> {
+    largest_value(values).map(|largest_value| LeadingOnesReport {
+        repeat,
+        leading_ones: leading_ones_count(&largest_value, active_bit_width()),
+        largest_value,
+    })
+}
+
+fn prefix_bits(value: &BigUint, width: u64, take: usize) -> String {
+    let bits = to_bits(value, width);
+    bits.chars().take(take).collect()
+}
+
+fn write_bits_report(reports: &[LeadingOnesReport]) -> Result<(), Box<dyn std::error::Error>> {
+    if reports.is_empty() {
+        match fs::remove_file(BITS_FILE) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        return Ok(());
+    }
+
+    let file = File::create(BITS_FILE)?;
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "DATE                         : 2026-04-26")?;
+    writeln!(writer, "BIT_WIDTH                    : {}", active_bit_width())?;
+    writeln!(writer, "FIELD                        : leading 1-bit run of the largest encoded value after each repeat")?;
+    writeln!(writer, "RULE                         : prefix 1110 => 3, prefix 1111... => run length until first 0")?;
+    writeln!(writer)?;
+
+    for report in reports {
+        writeln!(writer, "REPEAT                       : {}", report.repeat)?;
+        writeln!(writer, "LARGEST_LEADING_ONES         : {}", report.leading_ones)?;
+        writeln!(writer, "LARGEST_VALUE                : {}", summarize_biguint(&report.largest_value))?;
+        writeln!(writer, "LARGEST_PREFIX_BITS          : {}", prefix_bits(&report.largest_value, active_bit_width(), 64))?;
+        writeln!(writer, "{}", "-".repeat(80))?;
+    }
+
+    if let Some(min_report) = reports.iter().min_by_key(|report| report.leading_ones) {
+        writeln!(writer)?;
+        writeln!(writer, "MIN_LEADING_ONES             : {}", min_report.leading_ones)?;
+        writeln!(writer, "MIN_LEADING_ONES_REPEAT      : {}", min_report.repeat)?;
+        writeln!(writer, "MIN_LEADING_ONES_PREFIX      : {}", prefix_bits(&min_report.largest_value, bit_width(), 64))?;
+    }
+
+    if let Some(max_report) = reports.iter().max_by_key(|report| report.leading_ones) {
+        writeln!(writer, "MAX_LEADING_ONES             : {}", max_report.leading_ones)?;
+        writeln!(writer, "MAX_LEADING_ONES_REPEAT      : {}", max_report.repeat)?;
+        writeln!(writer, "MAX_LEADING_ONES_PREFIX      : {}", prefix_bits(&max_report.largest_value, bit_width(), 64))?;
+    }
+
+    Ok(())
+}
+
+fn detect_bit_width_from_file(path: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !trimmed.bytes().all(|b| b == b'0' || b == b'1') {
+            return Err(format!("Invalid character in bit string while detecting bit width. line={}", line_no + 1).into());
+        }
+        return Ok(trimmed.len() as u64);
+    }
+
+    Err(format!("Cannot detect bit width from empty source file: {}", path).into())
 }
 
 fn bit_count_ones(value: &BigUint) -> u64 {
@@ -122,7 +258,7 @@ fn entropy_stats(values: &[BigUint], width: u64) -> EntropyStats {
 }
 
 fn print_entropy(label: &str, values: &[BigUint]) {
-    let stats = entropy_stats(values, BIT_WIDTH);
+    let stats = entropy_stats(values, active_bit_width());
     println!(
         "{} entropy              : {:.6} bits/bit, ones={} ({:.4}%), zeros={}, total_bits={}",
         label,
@@ -224,50 +360,14 @@ fn summarize_gap_ratio(gap: &BigUint, raw_gap: &BigUint) -> String {
     format!("{}.{:06}%", whole, frac)
 }
 
-fn clear_metadata_file() -> Result<(), Box<dyn std::error::Error>> {
-    match fs::remove_file(METADATA_FILE) {
+fn clear_legacy_metadata_file() -> Result<(), Box<dyn std::error::Error>> {
+    // This experiment does not use metadata.txt. Remove stale files so a run is
+    // self-contained and decode never depends on external overflow metadata.
+    match fs::remove_file("metadata.txt") {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
     }
-}
-
-// metadata.txt is intentionally minimal: one line per repeat pass.
-// Blank line = no overflow; bit line = high GAP bits that did not fit inline.
-fn append_gap_overflow_metadata(overflow: Option<&BigUint>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(METADATA_FILE)?;
-    if let Some(overflow) = overflow {
-        writeln!(file, "{}", overflow.to_str_radix(2))?;
-    } else {
-        writeln!(file)?;
-    }
-    Ok(())
-}
-
-// Decode addresses overflow by repeat number, so line N belongs to repeat N.
-fn read_gap_overflow_metadata(repeat: usize) -> Result<Option<BigUint>, Box<dyn std::error::Error>> {
-    let file = match File::open(METADATA_FILE) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let reader = BufReader::new(file);
-    for (line_no, line) in reader.lines().enumerate() {
-        let line = line?;
-        let trimmed = line.trim();
-        if line_no + 1 != repeat {
-            continue;
-        }
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(from_bits(trimmed)?));
-    }
-
-    Ok(None)
 }
 
 fn from_bits(s: &str) -> Result<BigUint, String> {
@@ -283,23 +383,99 @@ fn bits_needed_for_count(count: usize) -> u64 {
     }
 }
 
-fn metadata_gap_bits(index_bits: u64) -> Result<u64, String> {
-    let metadata_bits = index_bits
-        .checked_mul(2)
-        .ok_or_else(|| "Metadata index bits overflow.".to_string())?;
-    BIT_WIDTH
-        .checked_sub(metadata_bits)
-        .ok_or_else(|| format!("BIT_WIDTH {} is too small for {} metadata index bits.", BIT_WIDTH, metadata_bits))
+fn companion_space(count: usize) -> Result<BigUint, String> {
+    if count < 2 {
+        return Err("At least 2 blocks are required for companion metadata.".to_string());
+    }
+    Ok(BigUint::from(count as u64))
+}
+
+fn bits_needed_for_states(states: &BigUint) -> u64 {
+    if states.is_zero() {
+        return 1;
+    }
+    let one = BigUint::from(1u32);
+    if *states <= one {
+        1
+    } else {
+        (states - one).bits()
+    }
+}
+
+fn metadata_gap_bits_for_count(count: usize) -> Result<u64, String> {
+    let companion_space = companion_space(count)?;
+    let companion_bits = bits_needed_for_states(&companion_space);
+    active_bit_width()
+        .checked_sub(companion_bits)
+        .ok_or_else(|| format!("bit_width {} is too small for {} companion metadata bits.", active_bit_width(), companion_bits))
+}
+
+fn pack_companion_gap(
+    gap: &BigUint,
+    companion_orig_index: usize,
+    count: usize,
+) -> Result<BigUint, String> {
+    if companion_orig_index >= count {
+        return Err(format!(
+            "Companion position {} does not fit in count {}.",
+            companion_orig_index, count
+        ));
+    }
+
+    // Self-sum metadata packing, old-style mixed-radix:
+    // metadata_block = GAP * COUNT + companion_index
+    // The metadata host index is not stored. Decode identifies it as the
+    // largest block after metadata embedding.
+    let metadata_block = gap * BigUint::from(count as u64) + BigUint::from(companion_orig_index as u64);
+
+    // Experimental self-sum mode: do not reject a metadata block just because
+    // it is wider than the configured/original block width. The whole point of
+    // this experiment is to let the self-sum value grow and observe repeat
+    // behavior with a dynamically widened working width.
+    Ok(metadata_block)
+}
+
+fn unpack_companion_gap(
+    metadata_block: &BigUint,
+    count: usize,
+) -> Result<(usize, BigUint), String> {
+    let base = BigUint::from(count as u64);
+    let companion = biguint_to_usize(metadata_block % &base);
+    let gap = metadata_block / &base;
+
+    if companion >= count {
+        return Err(format!(
+            "Decoded companion index {} is out of range for count {}.",
+            companion, count
+        ));
+    }
+    if gap.is_zero() {
+        return Err("Recovered GAP is zero.".to_string());
+    }
+
+    Ok((companion, gap))
+}
+
+
+fn biguint_to_usize(value: BigUint) -> usize {
+    let digits = value.to_u64_digits();
+    if digits.is_empty() {
+        0
+    } else {
+        digits[0] as usize
+    }
 }
 
 fn bit_mask() -> BigUint {
-    (BigUint::from(1u32) << BIT_WIDTH) - 1u32
+    (BigUint::from(1u32) << active_bit_width()) - 1u32
 }
 
 // Even repeat passes do not mutate stored data; they only sort and compute
 // through the complementary 4096-bit view.
-fn use_inverted_view(repeat: usize) -> bool {
-    repeat % 2 == 0
+fn use_inverted_view(_repeat: usize) -> bool {
+    // Experimental self-sum mode: always use the normal view.
+    // This disables the previous even-repeat inverted read path.
+    false
 }
 
 fn view_value(value: &BigUint, inverted: bool) -> Result<BigUint, String> {
@@ -308,7 +484,7 @@ fn view_value(value: &BigUint, inverted: bool) -> Result<BigUint, String> {
         if value > &mask {
             return Err(format!(
                 "Value exceeds {} bit view mask. value_bits={}",
-                BIT_WIDTH,
+                active_bit_width(),
                 value.bits()
             ));
         }
@@ -465,87 +641,45 @@ fn reorder_to_original_order<T: Clone>(sorted: &[SortedValue], values_in_sorted_
     pairs.into_iter().map(|(_, value)| value).collect()
 }
 
-fn pack_metadata_block(
-    gap: &BigUint,
-    metadata_host_orig_index: usize,
-    companion_orig_index: usize,
-    index_bits: u64,
-) -> Result<(BigUint, Option<BigUint>), String> {
-    let gap_bits = metadata_gap_bits(index_bits)?;
-    let max_index = 1usize
-        .checked_shl(index_bits as u32)
-        .ok_or_else(|| format!("Metadata index width {} is too large for this platform.", index_bits))?;
-    if metadata_host_orig_index >= max_index {
-        return Err(format!(
-            "Metadata host position {} does not fit in {} bits.",
-            metadata_host_orig_index, index_bits
-        ));
-    }
-    if companion_orig_index >= max_index {
-        return Err(format!(
-            "Companion position {} does not fit in {} bits.",
-            companion_orig_index, index_bits
-        ));
-    }
-    // The low GAP bits live in the metadata host block; any high bits are
-    // returned for metadata.txt instead of failing the repeat.
-    let gap_mask = (BigUint::from(1u32) << gap_bits) - 1u32;
-    let inline_gap = gap & &gap_mask;
-    let overflow_gap = gap >> gap_bits;
-    let overflow = if overflow_gap.is_zero() {
-        None
-    } else {
-        Some(overflow_gap)
-    };
-
-    let host = BigUint::from(metadata_host_orig_index as u64);
-    let companion = BigUint::from(companion_orig_index as u64);
-    let packed = (host << (BIT_WIDTH - index_bits))
-        | (companion << gap_bits)
-        | inline_gap;
-
-    if packed.bits() > BIT_WIDTH {
-        return Err(format!(
-            "Packed metadata block exceeds {} bits. packed_bits={}",
-            BIT_WIDTH,
-            packed.bits()
-        ));
-    }
-
-    Ok((packed, overflow))
+fn largest_excluding_index(values: &[BigUint], excluded_index: usize) -> Result<BigUint, String> {
+    values
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != excluded_index)
+        .map(|(_, value)| value.clone())
+        .max()
+        .ok_or_else(|| "Cannot find largest value excluding metadata host.".to_string())
 }
 
-fn biguint_to_usize(value: BigUint) -> usize {
-    let digits = value.to_u64_digits();
-    if digits.is_empty() {
-        0
-    } else {
-        digits[0] as usize
-    }
-}
-
-fn unpack_metadata_block(
-    packed: &BigUint,
-    index_bits: u64,
-    overflow: Option<&BigUint>,
-) -> Result<(usize, usize, BigUint), String> {
-    let gap_bits = metadata_gap_bits(index_bits)?;
-    let index_mask = (BigUint::from(1u32) << index_bits) - 1u32;
-    let gap_mask = (BigUint::from(1u32) << gap_bits) - 1u32;
-
-    let host = (packed >> (BIT_WIDTH - index_bits)) & &index_mask;
-    let companion = (packed >> gap_bits) & &index_mask;
-    let mut gap = packed & gap_mask;
-    if let Some(overflow) = overflow {
-        // Reattach high GAP bits from metadata.txt when a repeat overflowed.
-        gap |= overflow << gap_bits;
+fn largest_two_indices(values: &[BigUint]) -> Result<((usize, BigUint), (usize, BigUint)), String> {
+    if values.len() < 2 {
+        return Err("At least 2 blocks are required to recover self-sum metadata.".to_string());
     }
 
-    if gap.is_zero() {
-        return Err("Recovered GAP is zero.".to_string());
+    let mut top: Option<(usize, BigUint)> = None;
+    let mut second: Option<(usize, BigUint)> = None;
+
+    for (index, value) in values.iter().cloned().enumerate() {
+        match &top {
+            None => top = Some((index, value)),
+            Some((_, top_value)) if value > *top_value => {
+                second = top.take();
+                top = Some((index, value));
+            }
+            _ => match &second {
+                None => second = Some((index, value)),
+                Some((_, second_value)) if value > *second_value => {
+                    second = Some((index, value));
+                }
+                _ => {}
+            },
+        }
     }
 
-    Ok((biguint_to_usize(host), biguint_to_usize(companion), gap))
+    Ok((
+        top.ok_or_else(|| "Missing largest metadata block.".to_string())?,
+        second.ok_or_else(|| "Missing base block below metadata block.".to_string())?,
+    ))
 }
 
 fn embed_metadata_into_host(
@@ -553,30 +687,44 @@ fn embed_metadata_into_host(
     metadata_host_orig_index: usize,
     gap: &BigUint,
     source_companion_orig_index: usize,
-    index_bits: u64,
-) -> Result<Option<BigUint>, String> {
-    let (packed, overflow) =
-        pack_metadata_block(gap, metadata_host_orig_index, source_companion_orig_index, index_bits)?;
-    // Move the metadata host to the first output block, but store its original
-    // index inside the packed metadata so decode can undo the move.
-    outputs_in_original_order.swap(0, metadata_host_orig_index);
-    outputs_in_original_order[0] = packed;
-    Ok(overflow)
+    count: usize,
+) -> Result<(), String> {
+    let metadata_block = pack_companion_gap(gap, source_companion_orig_index, count)?;
+    let base = largest_excluding_index(outputs_in_original_order, metadata_host_orig_index)?;
+    let new_metadata_value = &base + &metadata_block;
+
+    // Experimental mode: self-sum width checks are temporarily disabled and output width may grow.
+    // If base + metadata_block exceeds the configured bit width, the value is
+    // still written as-is so the behavior can be observed without changing any
+    // other parameters.
+
+    // Keep the metadata host in its original output slot. No slot-0 swap and no
+    // host-index metadata are used in this experiment.
+    outputs_in_original_order[metadata_host_orig_index] = new_metadata_value;
+    Ok(())
 }
 
 fn restore_selected_pair_before_decode(
     outputs_in_original_order: &mut [BigUint],
-    index_bits: u64,
+    count: usize,
     inverted_view: bool,
-    overflow: Option<&BigUint>,
 ) -> Result<(BigUint, usize, usize), String> {
-    if outputs_in_original_order.is_empty() {
-        return Err("Decode source is empty.".to_string());
+    if outputs_in_original_order.len() < 2 {
+        return Err("Decode source must contain at least 2 blocks.".to_string());
     }
 
-    let packed = outputs_in_original_order[0].clone();
-    let (metadata_host_orig_index, source_companion_orig_index, gap) =
-        unpack_metadata_block(&packed, index_bits, overflow)?;
+    // The metadata host was made the largest real stored value by adding the
+    // companion+GAP metadata block to the largest non-host encoded value. The next
+    // largest value therefore recovers the additive base.
+    let ((metadata_host_orig_index, metadata_value), (_, base_value)) =
+        largest_two_indices(outputs_in_original_order)?;
+
+    if metadata_value <= base_value {
+        return Err("Invalid self-sum metadata ordering: largest <= second largest.".to_string());
+    }
+
+    let metadata_block = &metadata_value - &base_value;
+    let (source_companion_orig_index, gap) = unpack_companion_gap(&metadata_block, count)?;
 
     if metadata_host_orig_index >= outputs_in_original_order.len() {
         return Err(format!("Invalid metadata host index: {}", metadata_host_orig_index));
@@ -593,17 +741,13 @@ fn restore_selected_pair_before_decode(
         return Err("Metadata host and source companion cannot be the same block.".to_string());
     }
 
-    if metadata_host_orig_index != 0 {
-        // Put the block that was swapped into slot 0 back where it belongs.
-        outputs_in_original_order[0] = outputs_in_original_order[metadata_host_orig_index].clone();
-    }
-
     let high_output_key = view_value(&outputs_in_original_order[source_companion_orig_index], inverted_view)?;
     if high_output_key < BigUint::from(2u32) {
         return Err("High output key is too small to restore the pair with -2.".to_string());
     }
 
-    // The selected pair was constructed to differ by 2 after encoding.
+    // The selected pair was constructed to differ by 2 after encoding. Restore
+    // the overwritten metadata host output in the same view used by that pass.
     let restored_low_old_output_key = &high_output_key - 2u32;
     let restored_low_old_output = view_value(&restored_low_old_output_key, inverted_view)?;
     outputs_in_original_order[metadata_host_orig_index] = restored_low_old_output;
@@ -645,10 +789,23 @@ fn write_plain_bits(path: &str, values: &[BigUint], width: u64) -> Result<(), Bo
     Ok(())
 }
 
+fn write_plain_bits_auto(path: &str, values: &[BigUint]) -> Result<(), Box<dyn std::error::Error>> {
+    let width = max_value_bit_width(values);
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    for value in values {
+        writeln!(writer, "{}", to_bits(value, width))?;
+    }
+
+    Ok(())
+}
+
 fn read_plain_bits(path: &str, width: u64) -> Result<Vec<BigUint>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut values = Vec::new();
+    let mut detected_width: Option<usize> = None;
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line?;
@@ -658,20 +815,37 @@ fn read_plain_bits(path: &str, width: u64) -> Result<Vec<BigUint>, Box<dyn std::
             continue;
         }
 
-        if trimmed.len() != width as usize {
+        if !trimmed.bytes().all(|b| b == b'0' || b == b'1') {
+            return Err(format!("Invalid character in bit string. line={}", line_no + 1).into());
+        }
+
+        match detected_width {
+            None => detected_width = Some(trimmed.len()),
+            Some(current) if current != trimmed.len() => {
+                return Err(format!(
+                    "Inconsistent bit length. line={}, length={}, first_length={}",
+                    line_no + 1,
+                    trimmed.len(),
+                    current
+                ).into());
+            }
+            Some(_) => {}
+        }
+
+        if trimmed.len() < width as usize {
             return Err(format!(
-                "Invalid bit length. line={}, length={}, expected={}",
+                "Invalid bit length. line={}, length={}, minimum_expected={}",
                 line_no + 1,
                 trimmed.len(),
                 width
             ).into());
         }
 
-        if !trimmed.bytes().all(|b| b == b'0' || b == b'1') {
-            return Err(format!("Invalid character in bit string. line={}", line_no + 1).into());
-        }
-
         values.push(from_bits(trimmed)?);
+    }
+
+    if let Some(detected) = detected_width {
+        set_active_bit_width((detected as u64).max(width));
     }
 
     Ok(values)
@@ -687,7 +861,7 @@ fn write_smallest_two_outputs(outputs_in_original_order: &[BigUint]) -> Result<(
     let take_n = sorted.len().min(2);
 
     writeln!(writer, "DATE          : 2026-04-21")?;
-    writeln!(writer, "BIT_WIDTH     : {}", BIT_WIDTH)?;
+    writeln!(writer, "BIT_WIDTH     : {}", active_bit_width())?;
     writeln!(writer, "COUNT         : {}", outputs_in_original_order.len())?;
     writeln!(writer, "FIELD         : smallest 2 encoded values in original block order output set")?;
     writeln!(writer)?;
@@ -695,7 +869,7 @@ fn write_smallest_two_outputs(outputs_in_original_order: &[BigUint]) -> Result<(
     for (i, value) in sorted.iter().take(take_n).enumerate() {
         writeln!(writer, "RANK     : {}", i + 1)?;
         writeln!(writer, "OUT_DEC  : {}", value)?;
-        writeln!(writer, "OUT_BITS : {}", to_bits(value, BIT_WIDTH))?;
+        writeln!(writer, "OUT_BITS : {}", to_bits(value, active_bit_width()))?;
         writeln!(writer, "{}", "-".repeat(80))?;
     }
 
@@ -786,7 +960,7 @@ fn write_space(
     writeln!(writer, "ORDER_OK_BEFORE_EMBED       : {}", order_ok_before_embed)?;
     writeln!(writer, "REVERSIBLE_OK               : {}", reversible_ok)?;
     writeln!(writer, "COUNT                       : {}", sorted.len())?;
-    writeln!(writer, "BIT_WIDTH                   : {}", BIT_WIDTH)?;
+    writeln!(writer, "BIT_WIDTH                   : {}", active_bit_width())?;
     writeln!(writer, "METADATA_INDEX_BITS         : {}", metadata_index_bits)?;
     writeln!(writer, "METADATA_GAP_BITS           : {}", metadata_gap_bits)?;
     writeln!(writer, "GAP                         : {}", gap)?;
@@ -811,9 +985,9 @@ fn write_space(
         } else {
             writeln!(writer, "ROLE          : NORMAL")?;
         }
-        writeln!(writer, "IN_BITS       : {}", to_bits(&rec.x, BIT_WIDTH))?;
-        writeln!(writer, "OUT_BITS      : {}", to_bits(&outputs_in_original_order_after_embed[i], BIT_WIDTH))?;
-        writeln!(writer, "BACK_BITS     : {}", to_bits(&restored_in_original_order[i], BIT_WIDTH))?;
+        writeln!(writer, "IN_BITS       : {}", to_bits(&rec.x, active_bit_width()))?;
+        writeln!(writer, "OUT_BITS      : {}", to_bits(&outputs_in_original_order_after_embed[i], active_bit_width()))?;
+        writeln!(writer, "BACK_BITS     : {}", to_bits(&restored_in_original_order[i], active_bit_width()))?;
         writeln!(writer, "{}", "-".repeat(120))?;
     }
 
@@ -849,6 +1023,10 @@ fn repeat_count_from_path(path: &str) -> usize {
         .unwrap_or(1)
 }
 
+struct EncodePassResult {
+    outputs: Vec<BigUint>,
+}
+
 // One encode pass. In repeat mode `encoded_output_file` is None so intermediate
 // passes stay in memory and only the last successful repeat is written.
 fn encode_values(
@@ -856,12 +1034,14 @@ fn encode_values(
     encoded_output_file: Option<&str>,
     persist_default_input_copy: bool,
     repeat: usize,
-) -> Result<Vec<BigUint>, Box<dyn std::error::Error>> {
+    write_debug_files: bool,
+) -> Result<EncodePassResult, Box<dyn std::error::Error>> {
     if values.len() < 2 {
         return Err("Encode source must contain at least 2 blocks.".into());
     }
+    set_active_bit_width(max_value_bit_width(values));
     let metadata_index_bits = bits_needed_for_count(values.len());
-    let metadata_gap_bits = metadata_gap_bits(metadata_index_bits)
+    let metadata_gap_bits = metadata_gap_bits_for_count(values.len())
         .map_err(|e| format!("Metadata layout error: {}", e))?;
     let inverted_view = use_inverted_view(repeat);
 
@@ -884,22 +1064,19 @@ fn encode_values(
     let metadata_host_orig_index = sorted[source_left_sorted_pos].orig_index;
     let source_companion_orig_index = sorted[source_right_sorted_pos].orig_index;
 
-    let gap_overflow = embed_metadata_into_host(
+    embed_metadata_into_host(
         &mut outputs_in_original_order,
         metadata_host_orig_index,
         &gap,
         source_companion_orig_index,
-        metadata_index_bits,
+        values.len(),
     ).map_err(|e| format!("Metadata embed error: {}", e))?;
-    append_gap_overflow_metadata(gap_overflow.as_ref())?;
-
     let mut outputs_for_decode_in_original_order = outputs_in_original_order.to_vec();
     let (recovered_gap, recovered_companion_pos, recovered_metadata_host_pos) =
         restore_selected_pair_before_decode(
             &mut outputs_for_decode_in_original_order,
-            metadata_index_bits,
+            values.len(),
             inverted_view,
-            gap_overflow.as_ref(),
         )
             .map_err(|e| format!("Pre-decode restore error: {}", e))?;
 
@@ -915,43 +1092,45 @@ fn encode_values(
         .zip(values.iter())
         .all(|(a, b)| a == b);
 
-    write_smallest_two_outputs(&outputs_in_original_order)?;
-    write_gap(
-        source_left_sorted_pos,
-        source_right_sorted_pos,
-        metadata_host_orig_index,
-        source_companion_orig_index,
-        &raw_gap,
-        &gap,
-        metadata_index_bits,
-        metadata_gap_bits,
-        &outputs_in_sorted_order_before_embed,
-        &outputs_in_original_order,
-    )?;
+    if write_debug_files {
+        write_smallest_two_outputs(&outputs_in_original_order)?;
+        write_gap(
+            source_left_sorted_pos,
+            source_right_sorted_pos,
+            metadata_host_orig_index,
+            source_companion_orig_index,
+            &raw_gap,
+            &gap,
+            metadata_index_bits,
+            metadata_gap_bits,
+            &outputs_in_sorted_order_before_embed,
+            &outputs_in_original_order,
+        )?;
+        write_space(
+            &sorted,
+            &encoded_records_in_sorted_order,
+            &outputs_in_original_order,
+            &restored_in_original_order,
+            &recovered_gap,
+            recovered_metadata_host_pos,
+            recovered_companion_pos,
+            metadata_index_bits,
+            metadata_gap_bits,
+            order_ok_before_embed,
+            reversible_ok,
+        )?;
+    }
     if persist_default_input_copy {
-        write_plain_bits(INPUT_BITS_FILE, values, BIT_WIDTH)?;
+        write_plain_bits(INPUT_BITS_FILE, values, bit_width())?;
     }
     if let Some(encoded_output_file) = encoded_output_file {
-        write_plain_bits(encoded_output_file, &outputs_in_original_order, BIT_WIDTH)?;
+        write_plain_bits_auto(encoded_output_file, &outputs_in_original_order)?;
     }
-    write_space(
-        &sorted,
-        &encoded_records_in_sorted_order,
-        &outputs_in_original_order,
-        &restored_in_original_order,
-        &recovered_gap,
-        recovered_metadata_host_pos,
-        recovered_companion_pos,
-        metadata_index_bits,
-        metadata_gap_bits,
-        order_ok_before_embed,
-        reversible_ok,
-    )?;
 
     println!("Completed.");
     println!("Date                         : 2026-04-21");
     println!("Record count                 : {}", values.len());
-    println!("Bit width                    : {}", BIT_WIDTH);
+    println!("Bit width                    : {}", active_bit_width());
     println!("Repeat                       : {}", repeat);
     println!("View                         : {}", if inverted_view { "inverted" } else { "normal" });
     println!("Restore delta                : 2");
@@ -970,6 +1149,9 @@ fn encode_values(
     println!("space.txt                    : {}", OUTPUT_FILE);
     println!("smallest_two_outputs.txt     : {}", SMALLEST_TWO_OUTPUTS_FILE);
     println!("gap.txt                      : {}", GAP_FILE);
+    if write_debug_files {
+        println!("bits.txt                     : {}", BITS_FILE);
+    }
     if persist_default_input_copy {
         println!("input.txt                    : {}", INPUT_BITS_FILE);
     }
@@ -977,20 +1159,28 @@ fn encode_values(
         println!("encoded output               : {}", encoded_output_file);
     }
 
-    Ok(outputs_in_original_order)
+    Ok(EncodePassResult {
+        outputs: outputs_in_original_order,
+    })
 }
 
 fn run_encode_mode() -> Result<(), Box<dyn std::error::Error>> {
-    clear_metadata_file()?;
-    let values = generate_unique_values(COUNT, BIT_WIDTH);
-    encode_values(&values, Some(ENCODE_BITS_FILE), true, 1)?;
+    clear_legacy_metadata_file()?;
+    let values = generate_unique_values(config().count, bit_width());
+    let result = encode_values(&values, Some(ENCODE_BITS_FILE), true, 1, true)?;
+    if let Some(report) = collect_leading_ones_report(1, &result.outputs) {
+        write_bits_report(&[report])?;
+    }
     Ok(())
 }
 
 fn run_encode_file_mode(source_file: &str, output_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    clear_metadata_file()?;
-    let values = read_plain_bits(source_file, BIT_WIDTH)?;
-    encode_values(&values, Some(output_file), false, 1)?;
+    clear_legacy_metadata_file()?;
+    let values = read_plain_bits(source_file, bit_width())?;
+    let result = encode_values(&values, Some(output_file), false, 1, true)?;
+    if let Some(report) = collect_leading_ones_report(1, &result.outputs) {
+        write_bits_report(&[report])?;
+    }
     Ok(())
 }
 
@@ -1000,23 +1190,61 @@ fn run_repeat_encode_mode(source_file: &str, output_file: &str) -> Result<(), Bo
 
 // Repeat until a requested count is reached or the transform hits a safe
 // stopping condition. Only the final successful repeat file is persisted.
+fn persist_final_repeat_outputs(
+    last_input_before_encode: &[BigUint],
+    final_values: &[BigUint],
+    final_file: &str,
+    final_repeat: usize,
+    leading_reports: &[LeadingOnesReport],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let final_result = encode_values(
+        last_input_before_encode,
+        Some(final_file),
+        false,
+        final_repeat,
+        true,
+    )?;
+
+    if final_result.outputs != final_values {
+        return Err("Internal repeat finalization mismatch: recomputed final output differs.".into());
+    }
+
+    write_bits_report(leading_reports)?;
+    println!("encoded output               : {}", final_file);
+    Ok(())
+}
+
+// Repeat until a requested count is reached or the transform hits a safe
+// stopping condition. Intermediate repeat passes stay in memory. Only the final
+// successful output/debug files are persisted. metadata.txt is not used.
 fn run_repeat_encode_mode_with_limit(
     source_file: &str,
     output_file: &str,
     max_repeats: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    clear_metadata_file()?;
-    let mut values = read_plain_bits(source_file, BIT_WIDTH)?;
+    clear_legacy_metadata_file()?;
+    let mut values = read_plain_bits(source_file, bit_width())?;
     let mut repeat = 1usize;
     let mut last_completed_repeat = 0usize;
     let mut last_repeated_file = String::new();
+    let mut last_input_before_encode: Option<Vec<BigUint>> = None;
+    let mut leading_reports: Vec<LeadingOnesReport> = Vec::new();
 
     loop {
         if let Some(max_repeats) = max_repeats {
             if repeat > max_repeats {
                 if last_completed_repeat > 0 {
-                    write_plain_bits(&last_repeated_file, &values, BIT_WIDTH)?;
-                    println!("encoded output               : {}", last_repeated_file);
+                    persist_final_repeat_outputs(
+                        last_input_before_encode
+                            .as_ref()
+                            .ok_or("Missing final repeat input during finalization.")?,
+                        &values,
+                        &last_repeated_file,
+                        last_completed_repeat,
+                        &leading_reports,
+                    )?;
+                } else {
+                    write_bits_report(&leading_reports)?;
                 }
                 println!("Requested repeats completed  : {}", max_repeats);
                 return Ok(());
@@ -1024,25 +1252,38 @@ fn run_repeat_encode_mode_with_limit(
         }
 
         let repeated_file = repeated_output_name(output_file, repeat);
-        match encode_values(&values, None, false, repeat) {
-            Ok(encoded) => {
+        let current_input = values.clone();
+        match encode_values(&current_input, None, false, repeat, false) {
+            Ok(result) => {
                 println!("Repeat {} completed          : {}", repeat, repeated_file);
-                values = encoded;
+                if let Some(report) = collect_leading_ones_report(repeat, &result.outputs) {
+                    leading_reports.push(report);
+                }
+                values = result.outputs;
+                last_input_before_encode = Some(current_input);
                 last_completed_repeat = repeat;
                 last_repeated_file = repeated_file;
                 repeat += 1;
             }
             Err(err) => {
                 let message = err.to_string();
-                let compression_limit_reached = message.contains(
-                    "Metadata embed error: GAP does not fit after inline metadata indexes.",
-                ) || message.contains("Gap source error: Safe GAP cannot be produced.")
-                    || message.contains("Gap source error: Underflow risk at sorted rank");
+                let compression_limit_reached = message.contains("Gap source error: Safe GAP cannot be produced.")
+                    || message.contains("Gap source error: Underflow risk at sorted rank")
+                    || message.contains("Metadata embed error: Metadata self-sum overflow");
 
                 if compression_limit_reached {
                     if last_completed_repeat > 0 {
-                        write_plain_bits(&last_repeated_file, &values, BIT_WIDTH)?;
-                        println!("encoded output               : {}", last_repeated_file);
+                        persist_final_repeat_outputs(
+                            last_input_before_encode
+                                .as_ref()
+                                .ok_or("Missing final repeat input during finalization.")?,
+                            &values,
+                            &last_repeated_file,
+                            last_completed_repeat,
+                                &leading_reports,
+                        )?;
+                    } else {
+                            write_bits_report(&leading_reports)?;
                     }
                     println!("Repeat stopped before {}     : {}", repeat, message);
                     println!("Last completed repeat        : {}", last_completed_repeat);
@@ -1055,24 +1296,22 @@ fn run_repeat_encode_mode_with_limit(
 }
 
 // Decode one repeat pass. The caller supplies the repeat number so the same
-// normal/inverted view and metadata overflow line can be selected.
+// normal/inverted view can be selected.
 fn decode_values(outputs_in_original_order: &[BigUint], repeat: usize) -> Result<Vec<BigUint>, Box<dyn std::error::Error>> {
     if outputs_in_original_order.len() < 2 {
         return Err("Decode source must contain at least 2 blocks.".into());
     }
+    set_active_bit_width(max_value_bit_width(outputs_in_original_order));
     let metadata_index_bits = bits_needed_for_count(outputs_in_original_order.len());
-    let metadata_gap_bits = metadata_gap_bits(metadata_index_bits)
+    let metadata_gap_bits = metadata_gap_bits_for_count(outputs_in_original_order.len())
         .map_err(|e| format!("Metadata layout error: {}", e))?;
     let inverted_view = use_inverted_view(repeat);
-    let gap_overflow = read_gap_overflow_metadata(repeat)?;
-
     let mut outputs_for_decode_in_original_order = outputs_in_original_order.to_vec();
     let (recovered_gap, recovered_companion_pos, metadata_host_orig_index) =
         restore_selected_pair_before_decode(
             &mut outputs_for_decode_in_original_order,
-            metadata_index_bits,
+            outputs_in_original_order.len(),
             inverted_view,
-            gap_overflow.as_ref(),
         )
             .map_err(|e| format!("Pre-decode restore error: {}", e))?;
 
@@ -1084,7 +1323,7 @@ fn decode_values(outputs_in_original_order: &[BigUint], repeat: usize) -> Result
         ).map_err(|e| format!("Decode view error: {}", e))?;
 
     println!("Record count                 : {}", restored_in_original_order.len());
-    println!("Bit width                    : {}", BIT_WIDTH);
+    println!("Bit width                    : {}", active_bit_width());
     println!("Repeat                       : {}", repeat);
     println!("View                         : {}", if inverted_view { "inverted" } else { "normal" });
     println!("Restore delta                : 2");
@@ -1103,7 +1342,7 @@ fn decode_values(outputs_in_original_order: &[BigUint], repeat: usize) -> Result
 
 fn run_decode_mode(source_file: &str, output_file: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repeat_count = repeat_count_from_path(source_file);
-    let mut values = read_plain_bits(source_file, BIT_WIDTH)?;
+    let mut values = read_plain_bits(source_file, bit_width())?;
 
     // Repeat files are decoded backwards: .6, .5, ... .1.
     for repeat in (1..=repeat_count).rev() {
@@ -1111,7 +1350,7 @@ fn run_decode_mode(source_file: &str, output_file: &str) -> Result<(), Box<dyn s
         values = decode_values(&values, repeat)?;
     }
 
-    write_plain_bits(output_file, &values, BIT_WIDTH)?;
+    write_plain_bits_auto(output_file, &values)?;
 
     println!("Decode completed.");
     println!("Source file                  : {}", source_file);
@@ -1121,36 +1360,100 @@ fn run_decode_mode(source_file: &str, output_file: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
+fn parse_runtime_args(args: &[String]) -> Result<(Config, Vec<String>), String> {
+    let mut bit_width = DEFAULT_BIT_WIDTH;
+    let mut bit_width_explicit = false;
+    let mut count = DEFAULT_COUNT;
+    let mut positional = Vec::new();
+
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-b" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value after -b.".to_string());
+                }
+                bit_width = args[i]
+                    .parse::<u64>()
+                    .map_err(|_| format!("Invalid bit width: {}", args[i]))?;
+                bit_width_explicit = true;
+                if bit_width == 0 {
+                    return Err("Bit width must be at least 1.".to_string());
+                }
+            }
+            "-c" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value after -c.".to_string());
+                }
+                count = args[i]
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid count: {}", args[i]))?;
+                if count < 2 {
+                    return Err("Count must be at least 2.".to_string());
+                }
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    Ok((Config { bit_width, count, bit_width_explicit }, positional))
+}
+
+fn usage() -> &'static str {
+    "Usage:\n  program [-b <bit_width>] [-c <count>]\n  program [-b <bit_width>] [-c <count>] -e <source_bits_file> <encoded_output_file>\n  program [-b <bit_width>] [-c <count>] -r <source_bits_file> <encoded_output_file>\n  program [-b <bit_width>] [-c <count>] -r <repeat_count> <source_bits_file> <encoded_output_file>\n  program [-b <bit_width>] [-c <count>] -d <source_bits_file> <decoded_output_file>\n\nExample:\n  program -b 256 -c 1000\n  program -b 256 -c 1000 -r input.txt output.txt\n\nNotes:\n  If -b is omitted for -e/-r/-d, bit width is detected from the first non-empty input line.\n  metadata.txt is not used in the self-sum metadata experiment; self-sum overflow control is temporarily disabled.\n  bits.txt is written only after the final encode/repeat result."
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
+    let (mut runtime_config, positional) = parse_runtime_args(&args)
+        .map_err(|err| format!("{}\n\n{}", err, usage()))?;
 
-    if args.len() == 4 && args[1] == "-e" {
-        return run_encode_file_mode(&args[2], &args[3]);
+    if !runtime_config.bit_width_explicit {
+        let source_for_detection = if positional.len() == 3 && (positional[0] == "-e" || positional[0] == "-r" || positional[0] == "-d") {
+            Some(positional[1].as_str())
+        } else if positional.len() == 4 && positional[0] == "-r" {
+            Some(positional[2].as_str())
+        } else {
+            None
+        };
+
+        if let Some(source_file) = source_for_detection {
+            runtime_config.bit_width = detect_bit_width_from_file(source_file)?;
+        }
     }
 
-    if args.len() == 4 && args[1] == "-r" {
-        return run_repeat_encode_mode(&args[2], &args[3]);
+    if CONFIG.set(runtime_config).is_err() {
+        return Err("Runtime config was already initialized.".into());
+    }
+    set_active_bit_width(config().bit_width);
+
+    if positional.len() == 3 && positional[0] == "-e" {
+        return run_encode_file_mode(&positional[1], &positional[2]);
     }
 
-    if args.len() == 5 && args[1] == "-r" {
-        let max_repeats = args[2]
+    if positional.len() == 3 && positional[0] == "-r" {
+        return run_repeat_encode_mode(&positional[1], &positional[2]);
+    }
+
+    if positional.len() == 4 && positional[0] == "-r" {
+        let max_repeats = positional[1]
             .parse::<usize>()
-            .map_err(|_| format!("Invalid repeat count: {}", args[2]))?;
+            .map_err(|_| format!("Invalid repeat count: {}", positional[1]))?;
         if max_repeats == 0 {
             return Err("Repeat count must be at least 1.".into());
         }
-        return run_repeat_encode_mode_with_limit(&args[3], &args[4], Some(max_repeats));
+        return run_repeat_encode_mode_with_limit(&positional[2], &positional[3], Some(max_repeats));
     }
 
-    if args.len() == 4 && args[1] == "-d" {
-        return run_decode_mode(&args[2], &args[3]);
+    if positional.len() == 3 && positional[0] == "-d" {
+        return run_decode_mode(&positional[1], &positional[2]);
     }
 
-    if args.len() != 1 {
-        return Err(
-            "Usage:\n  program\n  program -e <source_bits_file> <encoded_output_file>\n  program -r <source_bits_file> <encoded_output_file>\n  program -r <repeat_count> <source_bits_file> <encoded_output_file>\n  program -d <source_bits_file> <decoded_output_file>"
-                .into(),
-        );
+    if !positional.is_empty() {
+        return Err(usage().into());
     }
 
     run_encode_mode()
